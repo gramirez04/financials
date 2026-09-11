@@ -2109,6 +2109,7 @@ class PandasModel(QAbstractTableModel):
             return str(val)
 
         elif role == Qt.ItemDataRole.EditRole: return 0.0 if pd.isna(val) or val == "" else val
+        elif role == Qt.ItemDataRole.UserRole: return 0.0 if pd.isna(val) or val == "" else val
         
         elif role == Qt.ItemDataRole.TextAlignmentRole:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter) if isinstance(val, (int, float, np.integer, np.floating)) else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -2132,8 +2133,12 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
     if not file_name: return
     try:
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        export_df = df.copy()
+        for col in export_df.columns:
+            if is_excel_percent_column(col) and pd.api.types.is_numeric_dtype(export_df[col]):
+                export_df[col] = export_df[col] / 100
         with pd.ExcelWriter(file_name, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Data')
+            export_df.to_excel(writer, index=False, sheet_name='Data')
             worksheet = writer.sheets['Data']
             worksheet.freeze_panes = "A2"
             for idx, col in enumerate(df.columns):
@@ -2156,8 +2161,6 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                         cell.number_format = "#,##0"
                 elif is_excel_percent_column(col):
                     for cell in worksheet[letter][1:]:
-                        if isinstance(cell.value, (int, float)):
-                            cell.value = cell.value / 100
                         cell.number_format = "0.00%"
                 elif pd.api.types.is_numeric_dtype(series):
                     for cell in worksheet[letter][1:]:
@@ -2247,7 +2250,7 @@ class GenericAnalysisWindow(QDialog):
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         proxy = QSortFilterProxyModel(table)
-        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSortRole(Qt.ItemDataRole.UserRole)
         proxy.setSourceModel(PandasModel(df_summary, parent=table))
         table.setModel(proxy)
         
@@ -2278,7 +2281,7 @@ class TagDetailDialog(QDialog):
         table.setAlternatingRowColors(True)
         table.setStyleSheet("QTableView { background-color: white; alternate-background-color: #fbfbfb; border: 1px solid #e1e8ed; }")
         proxy = QSortFilterProxyModel(table)
-        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSortRole(Qt.ItemDataRole.UserRole)
         proxy.setSourceModel(PandasModel(df_tag, parent=table))
         table.setModel(proxy)
         layout.addWidget(table)
@@ -2487,7 +2490,7 @@ class ChartDetailDialog(QDialog):
         table.setStyleSheet("QTableView { background-color: white; alternate-background-color: #fbfbfb; border: 1px solid #e1e8ed; }")
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         proxy = QSortFilterProxyModel(table)
-        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSortRole(Qt.ItemDataRole.UserRole)
         proxy.setSourceModel(PandasModel(df, parent=table))
         table.setModel(proxy)
         layout.addWidget(table)
@@ -3079,7 +3082,7 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         proxy = QSortFilterProxyModel(table)
-        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSortRole(Qt.ItemDataRole.UserRole)
         proxy.setSourceModel(PandasModel(df, parent=table))
         table.setModel(proxy)
         layout.addWidget(table)
@@ -3349,7 +3352,7 @@ class MainWindow(QMainWindow):
         table_widget._custom_model = model  
         proxy = QSortFilterProxyModel(table_widget)
         proxy.setSourceModel(model)
-        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSortRole(Qt.ItemDataRole.UserRole)
         table_widget._custom_proxy = proxy  
         table_widget.setModel(proxy)
 
