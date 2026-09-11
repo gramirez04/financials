@@ -1476,6 +1476,7 @@ class SettlementEngine:
         self.filter_cache: Dict[str, List[str]] = {}
         self.analysis_cache: Dict[Tuple, object] = {}
         self.current_page_cache: Dict[str, pd.DataFrame] = {}
+        self.view_cache_token: Tuple = ()
         self.last_error: str = ""
         self.inc_adv = True
         self.inc_tar = True
@@ -1738,6 +1739,12 @@ class SettlementEngine:
 
         self.dynamic_full_df = df_full
         self.filtered_df = df_full.loc[self._build_mask(df_full, filter_dict, search_text)].copy()
+        self.view_cache_token = (
+            tuple(sorted((k, v) for k, v in filter_dict.items() if v != "All")),
+            search_text.lower(),
+            self.inc_adv,
+            self.inc_tar,
+        )
         self._clear_analysis_cache()
         self._clear_page_cache()
 
@@ -1828,7 +1835,7 @@ class SettlementEngine:
             grouped["Commission_%"] = self._safe_divide(comm, sales) * 100
             grouped["Comm_Per_Box"] = self._safe_divide(comm, qty)
 
-            cost_cols_cleaned = [c for c in cost_cols_found if c != "TARIFF"]
+            cost_cols_cleaned = cost_cols_found
             final_cols = group_cols + ["Qty", "Gross_Sales", "Total_Costs", "Tariff", "Net_Return", "Grower_Ret_%", "Cost_Per_Box", "Return_Per_Box", "Commission_Rev", "Commission_%", "Comm_Per_Box"] + cost_cols_cleaned
             final_cols = [c for c in final_cols if c in grouped.columns]
 
@@ -3297,7 +3304,7 @@ class MainWindow(QMainWindow):
         self.update_table(self.tables[page_name], self.get_page_dataframe(page_name))
 
     def _page_cache_key(self, page_name: str) -> Tuple:
-        return (page_name, self.engine.inc_adv, self.engine.inc_tar, len(self.engine.filtered_df))
+        return (page_name, self.engine.view_cache_token)
 
     def update_dashboard(self):
         try:
