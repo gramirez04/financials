@@ -1463,11 +1463,11 @@ def is_whole_number_column(column_name: str) -> bool:
 
 def is_percent_column(column_name: str) -> bool:
     normalized = normalize_display_column_name(column_name)
-    return "%" in normalized or normalized in PERCENT_COLUMN_NAMES
+    return normalized in PERCENT_COLUMN_NAMES
 
 def is_excel_percent_column(column_name: str) -> bool:
     normalized = normalize_display_column_name(column_name)
-    return "%" in normalized or normalized in {"PERCENTILE RANK", "IMPORTANCE SCORE"}
+    return normalized in PERCENT_COLUMN_NAMES
 
 # ==========================================
 # 2. DATA CALCULATION ENGINE
@@ -3170,6 +3170,8 @@ class MainWindow(QMainWindow):
 
             def get_valid_options(col_name):
                 runtime_df = self.engine.dynamic_full_df if not self.engine.dynamic_full_df.empty else self.engine.raw_df
+                if col_name not in runtime_df.columns:
+                    return ["All"]
                 mask = pd.Series(True, index=runtime_df.index)
                 for k, v in active_filters.items():
                     if k != col_name and v != "All" and k in runtime_df.columns:
