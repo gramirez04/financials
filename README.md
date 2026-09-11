@@ -1621,11 +1621,10 @@ class SettlementEngine:
 
         run_series = df["SETTLEMENT_RUN"].astype("string").str.strip()
         run_numeric = pd.to_numeric(run_series, errors="coerce")
-        df["SETTLEMENT_RUN"] = np.where(
-            run_numeric.notna(),
-            run_numeric.astype("Int64").astype(str),
-            run_series.mask(run_series.isna() | run_series.str.lower().isin(INVALID_TEXT_VALUES), "Unknown")
-        )
+        normalized_runs = run_series.mask(run_series.isna() | run_series.str.lower().isin(INVALID_TEXT_VALUES), "Unknown")
+        numeric_mask = run_numeric.notna()
+        normalized_runs.loc[numeric_mask] = run_numeric.loc[numeric_mask].astype("Int64").astype(str)
+        df["SETTLEMENT_RUN"] = normalized_runs.astype(str)
         df["RUN_STR"] = df["SETTLEMENT_RUN"]
 
         if "Region" not in df.columns and "LOT_ID" in df.columns:
@@ -2895,7 +2894,7 @@ class MainWindow(QMainWindow):
             else:
                 btn.setStyleSheet("QPushButton { text-align: left; padding: 10px 10px 10px 15px; font-size: 13px; background-color: transparent; color: #cbd5e1; border: none; } QPushButton:hover { background-color: #334155; color: white; }")
         if not self.engine.raw_df.empty and index not in (0, 1):
-            self.refresh_current_page_table()
+            self.refresh_current_page_table(index)
 
     def setup_original_dashboard(self, layout):
         kpi_row1, kpi_row2, kpi_row3 = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
@@ -3297,8 +3296,8 @@ class MainWindow(QMainWindow):
             self.engine.current_page_cache[cache_key] = builders[page_name]()
         return self.engine.current_page_cache[cache_key].copy(deep=True)
 
-    def refresh_current_page_table(self):
-        page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex())
+    def refresh_current_page_table(self, index: Optional[int] = None):
+        page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex() if index is None else index)
         if not page_name or page_name not in self.tables:
             return
         self.update_table(self.tables[page_name], self.get_page_dataframe(page_name))
