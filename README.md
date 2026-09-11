@@ -1808,7 +1808,7 @@ class SettlementEngine:
         if self.filtered_df.empty: return pd.DataFrame()
         group_cols = [c for c in ["SETTLEMENT_RUN", "LOT_ID", "GROWER_NAME", "COMMODITY", "VARIETY", "BLOCK_NAME", "PALLET_TAG_ID"] if c in self.filtered_df.columns]
         
-        cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
+        cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
         if "_TARIFFS" in self.filtered_df.columns:
             dynamic_cost_cols = ["_TARIFFS"]
         elif "TARIFF" in self.filtered_df.columns:
@@ -2145,7 +2145,7 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
             for idx, col in enumerate(df.columns):
                 display_series = df[col]
                 series = export_df[col]
-                content_len = display_series.astype(str).map(len).max()
+                content_len = display_series.head(1000).astype(str).map(len).max()
                 content_len = int(content_len) if pd.notna(content_len) else 0
                 max_len = max(content_len, len(str(display_series.name))) + 2
                 
