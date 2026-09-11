@@ -1619,35 +1619,26 @@ class SettlementEngine:
         if "SETTLEMENT_RUN" not in df.columns:
             df["SETTLEMENT_RUN"] = pd.NA
 
-        if "SETTLEMENT_STATUS" not in df.columns:
-            run_numeric = pd.to_numeric(df["SETTLEMENT_RUN"], errors="coerce")
-            df["SETTLEMENT_STATUS"] = np.where(run_numeric.notna(), "Settled", "Pending")
-
         run_series = df["SETTLEMENT_RUN"].astype("string").str.strip()
         run_numeric = pd.to_numeric(run_series, errors="coerce")
+        df["SETTLEMENT_STATUS"] = np.where(run_numeric.notna(), "Settled", "Pending")
         normalized_runs = run_series.mask(run_series.isna() | run_series.str.lower().isin(INVALID_TEXT_VALUES), "Unknown")
         numeric_mask = run_numeric.notna()
         normalized_runs.loc[numeric_mask] = run_numeric.loc[numeric_mask].astype("Int64").astype(str)
         df["SETTLEMENT_RUN"] = normalized_runs.astype(str)
         df["RUN_STR"] = df["SETTLEMENT_RUN"]
 
-        if "Region" not in df.columns and "LOT_ID" in df.columns:
+        if "LOT_ID" in df.columns:
             lot_clean = df["LOT_ID"].astype(str).str.upper().str.rstrip("*")
             df["Region"] = np.select([lot_clean.str.endswith("W"), lot_clean.str.endswith("E")], ["West", "East"], default="Unknown")
 
         revenue_cols = [c for c in APP_CONFIG["REVENUE_COLUMNS"] if c in df.columns]
-        if "TOTAL_REVENUE" not in df.columns:
-            df["TOTAL_REVENUE"] = df[revenue_cols].sum(axis=1) if revenue_cols else 0.0
-        if "_OPEX_BASE" not in df.columns:
-            df["_OPEX_BASE"] = df[[c for c in opex_cols_map.keys() if c in df.columns]].sum(axis=1) if opex_cols_map else 0.0
-        if "_TARIFFS_BASE" not in df.columns:
-            df["_TARIFFS_BASE"] = df[[c for c in tar_cols if c in df.columns]].sum(axis=1) if tar_cols else 0.0
-        if "_ADVANCES_BASE" not in df.columns:
-            df["_ADVANCES_BASE"] = df[[c for c in adv_cols if c in df.columns]].sum(axis=1) if adv_cols else 0.0
-        if "_COMMISSIONS_BASE" not in df.columns:
-            df["_COMMISSIONS_BASE"] = df[[c for c in comm_cols if c in df.columns]].sum(axis=1) if comm_cols else 0.0
-        if "SEARCH_STRING" not in df.columns:
-            df["SEARCH_STRING"] = df[TEXT_COLUMNS].astype(str).agg(" ".join, axis=1).str.lower()
+        df["TOTAL_REVENUE"] = df[revenue_cols].sum(axis=1) if revenue_cols else 0.0
+        df["_OPEX_BASE"] = df[[c for c in opex_cols_map.keys() if c in df.columns]].sum(axis=1) if opex_cols_map else 0.0
+        df["_TARIFFS_BASE"] = df[[c for c in tar_cols if c in df.columns]].sum(axis=1) if tar_cols else 0.0
+        df["_ADVANCES_BASE"] = df[[c for c in adv_cols if c in df.columns]].sum(axis=1) if adv_cols else 0.0
+        df["_COMMISSIONS_BASE"] = df[[c for c in comm_cols if c in df.columns]].sum(axis=1) if comm_cols else 0.0
+        df["SEARCH_STRING"] = df[TEXT_COLUMNS].astype(str).agg(" ".join, axis=1).str.lower()
         return df
 
     def load_cache(self) -> bool:
@@ -2091,6 +2082,8 @@ class PandasModel(QAbstractTableModel):
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid(): return None
+        if index.row() >= self.rowCount() or index.column() >= self.columnCount():
+            return None
         val = self._df.iat[index.row(), index.column()]
 
         if role == Qt.ItemDataRole.DisplayRole:
@@ -2142,8 +2135,9 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
             worksheet = writer.sheets['Data']
             worksheet.freeze_panes = "A2"
             for idx, col in enumerate(df.columns):
-                series = df[col]
-                max_len = max((series.astype(str).map(len).max(), len(str(series.name)))) + 2
+                display_series = df[col]
+                series = export_df[col]
+                max_len = max((display_series.astype(str).map(len).max(), len(str(display_series.name)))) + 2
                 
                 # Dynamic column letter conversion to bypass >26 columns bug ('[' error)
                 col_idx = idx + 1
