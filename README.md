@@ -2146,7 +2146,9 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                         cell.number_format = "#,##0"
                 elif is_percent_column(col):
                     for cell in worksheet[letter][1:]:
-                        cell.number_format = '#,##0.00\\%'
+                        if isinstance(cell.value, (int, float)):
+                            cell.value = cell.value / 100
+                        cell.number_format = "0.00%"
                 elif pd.api.types.is_numeric_dtype(series):
                     for cell in worksheet[letter][1:]:
                         cell.number_format = "#,##0.00"
@@ -2658,6 +2660,7 @@ class MainWindow(QMainWindow):
         self.page_names_by_index = {idx: page_name for page_name, idx in self.pages_map.items()}
 
         self.stacked_widget = QStackedWidget()
+        self.stacked_widget.currentChanged.connect(self.on_page_changed)
         self.tables = {}
         self.nav_buttons = {}
 
@@ -2730,6 +2733,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.sidebar)
 
         self.navigate_to_page(0)
+        self.on_page_changed(0)
 
         # --- RIGHT CONTENT AREA ---
         content_layout = QVBoxLayout()
@@ -2888,6 +2892,8 @@ class MainWindow(QMainWindow):
 
     def navigate_to_page(self, index: int):
         self.stacked_widget.setCurrentIndex(index)
+
+    def on_page_changed(self, index: int):
         for i, btn in self.nav_buttons.items():
             if i == index:
                 btn.setStyleSheet("QPushButton { text-align: left; padding: 10px 10px 10px 15px; font-size: 14px; background-color: #3b82f6; color: white; border: none; font-weight: bold; border-left: 5px solid #60a5fa; }")
