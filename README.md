@@ -1574,7 +1574,7 @@ class SettlementEngine:
             if val != "All" and col in df.columns:
                 mask &= df[col].eq(val)
         if search_text and "SEARCH_STRING" in df.columns:
-            mask &= df["SEARCH_STRING"].str.contains(search_text.lower(), na=False)
+            mask &= df["SEARCH_STRING"].str.contains(search_text.lower(), na=False, regex=False)
         return mask
 
     def _clear_analysis_cache(self) -> None:
@@ -2146,7 +2146,7 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                         cell.number_format = "#,##0"
                 elif is_percent_column(col):
                     for cell in worksheet[letter][1:]:
-                        cell.number_format = "#,##0.00"
+                        cell.number_format = '#,##0.00\\%'
                 elif pd.api.types.is_numeric_dtype(series):
                     for cell in worksheet[letter][1:]:
                         cell.number_format = "#,##0.00"
