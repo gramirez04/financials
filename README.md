@@ -1808,7 +1808,7 @@ class SettlementEngine:
         if self.filtered_df.empty: return pd.DataFrame()
         group_cols = [c for c in ["SETTLEMENT_RUN", "LOT_ID", "GROWER_NAME", "COMMODITY", "VARIETY", "BLOCK_NAME", "PALLET_TAG_ID"] if c in self.filtered_df.columns]
         
-        cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
+        cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
         if "_TARIFFS" in self.filtered_df.columns:
             dynamic_cost_cols = ["_TARIFFS"]
         elif "TARIFF" in self.filtered_df.columns:
@@ -2157,10 +2157,7 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                     letter = chr(65 + remainder) + letter
                     
                 worksheet.column_dimensions[letter].width = min(max_len, 50)
-                if is_run_column(col):
-                    for cell in worksheet[letter][1:]:
-                        cell.number_format = "0"
-                elif is_whole_number_column(col):
+                if is_whole_number_column(col):
                     for cell in worksheet[letter][1:]:
                         cell.number_format = "#,##0"
                 elif is_excel_percent_column(col):
