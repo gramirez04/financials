@@ -1808,11 +1808,12 @@ class SettlementEngine:
         group_cols = [c for c in ["SETTLEMENT_RUN", "LOT_ID", "GROWER_NAME", "COMMODITY", "VARIETY", "BLOCK_NAME", "PALLET_TAG_ID"] if c in self.filtered_df.columns]
         
         cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
-        cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + cost_cols_found if c in self.filtered_df.columns]
+        dynamic_cost_cols = [c for c in ["_TARIFFS"] if c in self.filtered_df.columns]
+        cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + dynamic_cost_cols + [c for c in cost_cols_found if c != "TARIFF"] if c in self.filtered_df.columns]
 
         def build_tag_analysis() -> pd.DataFrame:
             grouped = self._grouped_sum(self.filtered_df, group_cols, cols_to_sum)
-            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "TARIFF": "Tariff", "_TARIFFS": "Tariff"})
+            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "_TARIFFS": "Tariff"})
 
             qty = grouped["Qty"] if "Qty" in grouped.columns else pd.Series(dtype=float)
             sales = grouped["Gross_Sales"] if "Gross_Sales" in grouped.columns else pd.Series(dtype=float)
@@ -3149,12 +3150,12 @@ class MainWindow(QMainWindow):
             inc_tar = self.cb_inc_tariffs.isChecked()
 
             def get_valid_options(col_name):
-                raw_df = self.engine.raw_df
-                mask = pd.Series(True, index=raw_df.index)
+                runtime_df = self.engine.dynamic_full_df if not self.engine.dynamic_full_df.empty else self.engine.raw_df
+                mask = pd.Series(True, index=runtime_df.index)
                 for k, v in active_filters.items():
-                    if k != col_name and v != "All" and k in raw_df.columns:
-                        mask &= raw_df[k].eq(v)
-                return ["All"] + self.engine._safe_sorted_unique(raw_df.loc[mask, col_name])
+                    if k != col_name and v != "All" and k in runtime_df.columns:
+                        mask &= runtime_df[k].eq(v)
+                return ["All"] + self.engine._safe_sorted_unique(runtime_df.loc[mask, col_name])
 
             for col, cb in self.combos.items():
                 cb.blockSignals(True)
@@ -3284,15 +3285,19 @@ class MainWindow(QMainWindow):
         }
         if page_name not in builders:
             return pd.DataFrame()
-        if page_name not in self.engine.current_page_cache:
-            self.engine.current_page_cache[page_name] = builders[page_name]()
-        return self.engine.current_page_cache[page_name].copy(deep=True)
+        cache_key = self._page_cache_key(page_name)
+        if cache_key not in self.engine.current_page_cache:
+            self.engine.current_page_cache[cache_key] = builders[page_name]()
+        return self.engine.current_page_cache[cache_key].copy(deep=True)
 
     def refresh_current_page_table(self):
         page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex())
         if not page_name or page_name not in self.tables:
             return
         self.update_table(self.tables[page_name], self.get_page_dataframe(page_name))
+
+    def _page_cache_key(self, page_name: str) -> Tuple:
+        return (page_name, self.engine.inc_adv, self.engine.inc_tar, len(self.engine.filtered_df))
 
     def update_dashboard(self):
         try:
