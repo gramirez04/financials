@@ -1802,7 +1802,7 @@ class SettlementEngine:
 
         def build_tag_analysis() -> pd.DataFrame:
             grouped = self._grouped_sum(self.filtered_df, group_cols, cols_to_sum)
-            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "TARIFF": "Tariff"})
+            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "TARIFF": "Tariff", "_TARIFFS": "Tariff"})
 
             qty = grouped["Qty"] if "Qty" in grouped.columns else pd.Series(dtype=float)
             sales = grouped["Gross_Sales"] if "Gross_Sales" in grouped.columns else pd.Series(dtype=float)
@@ -1931,6 +1931,8 @@ class SettlementEngine:
         if self.filtered_df.empty: return pd.DataFrame()
         profile_cols = ["COMMODITY", "VARIETY", "STYLE", "SIZENAME", "COLOR", "GRADE"]
         valid_cols = [c for c in profile_cols if c in self.filtered_df.columns]
+        if not valid_cols:
+            return pd.DataFrame()
         def build_price_variance() -> pd.DataFrame:
             market = self._grouped_sum(self.dynamic_full_df, valid_cols, ["NET_RETURN", "QTY_RECEIVED"])
             market["Market_Avg_Return"] = self._safe_divide(market["NET_RETURN"], market["QTY_RECEIVED"])
@@ -1951,6 +1953,8 @@ class SettlementEngine:
     def get_market_benchmarks(self) -> pd.DataFrame:
         if not hasattr(self, 'dynamic_full_df') or self.dynamic_full_df.empty: return pd.DataFrame()
         valid_cols = [c for c in ["COMMODITY", "VARIETY", "GRADE"] if c in self.dynamic_full_df.columns]
+        if not valid_cols:
+            return pd.DataFrame()
         def calc_bmarks(x):
             rets = (x["NET_RETURN"] / x["QTY_RECEIVED"].replace(0, np.nan)).fillna(0).to_numpy()
             rets = rets[rets > 0]
