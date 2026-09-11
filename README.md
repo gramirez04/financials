@@ -1834,7 +1834,7 @@ class SettlementEngine:
             grouped["Commission_%"] = self._safe_divide(comm, sales) * 100
             grouped["Comm_Per_Box"] = self._safe_divide(comm, qty)
 
-            cost_cols_cleaned = cost_cols_found
+            cost_cols_cleaned = [c for c in cost_cols_found if c != "TARIFF"]
             final_cols = group_cols + ["Qty", "Gross_Sales", "Total_Costs", "Tariff", "Net_Return", "Grower_Ret_%", "Cost_Per_Box", "Return_Per_Box", "Commission_Rev", "Commission_%", "Comm_Per_Box"] + cost_cols_cleaned
             final_cols = [c for c in final_cols if c in grouped.columns]
 
@@ -2146,7 +2146,7 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                         cell.number_format = "#,##0"
                 elif is_percent_column(col):
                     for cell in worksheet[letter][1:]:
-                        cell.number_format = '0.00"%"'
+                        cell.number_format = "#,##0.00"
                 elif pd.api.types.is_numeric_dtype(series):
                     for cell in worksheet[letter][1:]:
                         cell.number_format = "#,##0.00"
