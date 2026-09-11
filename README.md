@@ -1589,13 +1589,13 @@ class SettlementEngine:
 
     @staticmethod
     def _cache_result(value):
-        return value.copy(deep=True) if isinstance(value, pd.DataFrame) else value
+        return value
 
     def _get_cached_result(self, key: Tuple, builder):
         if key not in self.analysis_cache:
             self.analysis_cache[key] = self._cache_result(builder())
         cached = self.analysis_cache[key]
-        return cached.copy(deep=True) if isinstance(cached, pd.DataFrame) else cached
+        return cached.copy(deep=False) if isinstance(cached, pd.DataFrame) else cached
 
     def _grouped_sum(self, df: pd.DataFrame, group_by_cols: List[str], cols_to_sum: List[str]) -> pd.DataFrame:
         if df.empty or not group_by_cols:
@@ -3309,7 +3309,7 @@ class MainWindow(QMainWindow):
         cache_key = self._page_cache_key(page_name)
         if cache_key not in self.engine.current_page_cache:
             self.engine.current_page_cache[cache_key] = builders[page_name]()
-        return self.engine.current_page_cache[cache_key].copy(deep=True)
+        return self.engine.current_page_cache[cache_key].copy(deep=False)
 
     def refresh_current_page_table(self, index: Optional[int] = None):
         page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex() if index is None else index)
