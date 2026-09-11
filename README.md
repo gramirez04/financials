@@ -4,7 +4,6 @@ import json
 import traceback
 import pyodbc
 import warnings
-import gc  
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
@@ -63,7 +62,18 @@ filtered_setl_runs AS (
 ------------------------------------------------------------------------- */
 receipt_rows AS (
     SELECT
-        recv.*,
+        recv.galotidx,
+        recv.gablockidx,
+        recv.ictrxhdridx,
+        recv.tagid,
+        recv.icqnt,
+        recv.receivedate,
+        recv.commodity,
+        recv.variety,
+        recv.style,
+        recv.sizename,
+        recv.color,
+        recv.grade,
         UPPER(TRIM(recv.commodity)) AS commodity_norm,
         UPPER(TRIM(recv.variety)) AS variety_norm,
         UPPER(TRIM(recv.style)) AS style_norm,
@@ -1435,6 +1445,25 @@ def build_required_columns() -> List[str]:
 
 REQUIRED_COLUMNS = build_required_columns()
 TEXT_COLUMNS = ["GROWER_NAME", "COMMODITY", "VARIETY", "STYLE", "SIZENAME", "COLOR", "GRADE", "LOT_ID", "BLOCK_NAME", "PALLET_TAG_ID"]
+INVALID_TEXT_VALUES = {"nan", "<na>", "none", "unknown", ""}
+WHOLE_NUMBER_COLUMN_TOKENS = ("QTY", "QUANTITY", "VOLUME", "UNIT", "UNITS", "COUNT", "TOTAL BOXES")
+WHOLE_NUMBER_COLUMN_NAMES = {"COUNT", "TOTAL GROWERS", "TOTAL LOTS", "TOTAL COMMODITIES", "TOTAL VARIETIES"}
+PERCENT_COLUMN_TOKENS = ("MARGIN", "%", "RET_%", "PERCENT", "PERCENTILE", "RANK", "SCORE")
+
+def normalize_display_column_name(column_name: str) -> str:
+    return str(column_name).replace("_", " ").strip().upper()
+
+def is_run_column(column_name: str) -> bool:
+    normalized = normalize_display_column_name(column_name)
+    return "RUN" in normalized and "%" not in normalized
+
+def is_whole_number_column(column_name: str) -> bool:
+    normalized = normalize_display_column_name(column_name)
+    return normalized in WHOLE_NUMBER_COLUMN_NAMES or any(token in normalized for token in WHOLE_NUMBER_COLUMN_TOKENS)
+
+def is_percent_column(column_name: str) -> bool:
+    normalized = normalize_display_column_name(column_name)
+    return any(token in normalized for token in PERCENT_COLUMN_TOKENS)
 
 # ==========================================
 # 2. DATA CALCULATION ENGINE
@@ -1445,6 +1474,8 @@ class SettlementEngine:
         self.dynamic_full_df = pd.DataFrame()
         self.filtered_df = pd.DataFrame()
         self.filter_cache: Dict[str, List[str]] = {}
+        self.analysis_cache: Dict[Tuple, object] = {}
+        self.current_page_cache: Dict[str, pd.DataFrame] = {}
         self.last_error: str = ""
         self.inc_adv = True
         self.inc_tar = True
@@ -1487,7 +1518,6 @@ class SettlementEngine:
                             chunk[col] = chunk[col].astype('float32')
                             
                         processed_chunks.append(chunk)
-                        gc.collect()
 
                     if not processed_chunks:
                         raise ValueError("The SQL query returned no data.")
@@ -1519,14 +1549,103 @@ class SettlementEngine:
     def _normalize_text(df: pd.DataFrame, cols: List[str]) -> None:
         for col in cols:
             if col in df.columns:
-                df[col] = df[col].apply(lambda x: "Unknown" if pd.isna(x) else str(x).strip())
+                cleaned = df[col].astype("string").str.strip()
+                invalid_mask = cleaned.isna()
+                lowered = cleaned.str.lower()
+                invalid_mask |= lowered.isin(INVALID_TEXT_VALUES)
+                df[col] = cleaned.mask(invalid_mask, "Unknown").astype(str)
             else:
                 df[col] = "Unknown"
+
+    @staticmethod
+    def _safe_sorted_unique(series: pd.Series) -> List[str]:
+        cleaned = pd.Series(series, copy=False).astype("string").str.strip()
+        cleaned = cleaned[cleaned.notna()]
+        if cleaned.empty:
+            return []
+        cleaned = cleaned[~cleaned.str.lower().isin(INVALID_TEXT_VALUES)]
+        return sorted(pd.unique(cleaned).tolist())
+
+    @staticmethod
+    def _build_mask(df: pd.DataFrame, filter_dict: dict, search_text: str = "") -> pd.Series:
+        mask = pd.Series(True, index=df.index)
+        for col, val in filter_dict.items():
+            if val != "All" and col in df.columns:
+                mask &= df[col].eq(val)
+        if search_text and "SEARCH_STRING" in df.columns:
+            mask &= df["SEARCH_STRING"].str.contains(search_text.lower(), na=False)
+        return mask
+
+    def _clear_analysis_cache(self) -> None:
+        self.analysis_cache = {}
+        self.current_page_cache = {}
+
+    @staticmethod
+    def _cache_result(value):
+        return value.copy(deep=True) if isinstance(value, pd.DataFrame) else value
+
+    def _get_cached_result(self, key: Tuple, builder):
+        if key not in self.analysis_cache:
+            self.analysis_cache[key] = self._cache_result(builder())
+        cached = self.analysis_cache[key]
+        return cached.copy(deep=True) if isinstance(cached, pd.DataFrame) else cached
+
+    def _grouped_sum(self, df: pd.DataFrame, group_by_cols: List[str], cols_to_sum: List[str]) -> pd.DataFrame:
+        if df.empty or not group_by_cols:
+            return pd.DataFrame()
+        return df.groupby(group_by_cols, as_index=False, observed=True)[cols_to_sum].sum()
+
+    @staticmethod
+    def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+        num = numerator.to_numpy(dtype=float, copy=False)
+        den = denominator.to_numpy(dtype=float, copy=False)
+        return pd.Series(
+            np.divide(num, den, out=np.zeros_like(num, dtype=float), where=den != 0),
+            index=numerator.index,
+        )
+
+    def _ensure_runtime_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "SETTLEMENT_RUN" not in df.columns:
+            df["SETTLEMENT_RUN"] = pd.NA
+
+        if "SETTLEMENT_STATUS" not in df.columns:
+            run_numeric = pd.to_numeric(df["SETTLEMENT_RUN"], errors="coerce")
+            df["SETTLEMENT_STATUS"] = np.where(run_numeric.notna(), "Settled", "Pending")
+
+        run_series = df["SETTLEMENT_RUN"].astype("string").str.strip()
+        run_numeric = pd.to_numeric(run_series, errors="coerce")
+        df["SETTLEMENT_RUN"] = np.where(
+            run_numeric.notna(),
+            run_numeric.astype("Int64").astype(str),
+            run_series.mask(run_series.isna() | run_series.str.lower().isin(INVALID_TEXT_VALUES), "Unknown")
+        )
+        df["RUN_STR"] = df["SETTLEMENT_RUN"]
+
+        if "Region" not in df.columns and "LOT_ID" in df.columns:
+            lot_clean = df["LOT_ID"].astype(str).str.upper().str.rstrip("*")
+            df["Region"] = np.select([lot_clean.str.endswith("W"), lot_clean.str.endswith("E")], ["West", "East"], default="Unknown")
+
+        revenue_cols = [c for c in APP_CONFIG["REVENUE_COLUMNS"] if c in df.columns]
+        if "TOTAL_REVENUE" not in df.columns:
+            df["TOTAL_REVENUE"] = df[revenue_cols].sum(axis=1) if revenue_cols else 0.0
+        if "_OPEX_BASE" not in df.columns:
+            df["_OPEX_BASE"] = df[[c for c in self.opex_cols_map.keys() if c in df.columns]].sum(axis=1) if self.opex_cols_map else 0.0
+        if "_TARIFFS_BASE" not in df.columns:
+            df["_TARIFFS_BASE"] = df[[c for c in self.tar_cols if c in df.columns]].sum(axis=1) if self.tar_cols else 0.0
+        if "_ADVANCES_BASE" not in df.columns:
+            df["_ADVANCES_BASE"] = df[[c for c in self.adv_cols if c in df.columns]].sum(axis=1) if self.adv_cols else 0.0
+        if "_COMMISSIONS_BASE" not in df.columns:
+            df["_COMMISSIONS_BASE"] = df[[c for c in self.comm_cols if c in df.columns]].sum(axis=1) if self.comm_cols else 0.0
+        if "SEARCH_STRING" not in df.columns:
+            df["SEARCH_STRING"] = df[TEXT_COLUMNS].astype(str).agg(" ".join, axis=1).str.lower()
+        return df
 
     def load_cache(self) -> bool:
         if os.path.exists(CACHE_FILE):
             try:
                 self.raw_df = pd.read_pickle(CACHE_FILE)
+                self.raw_df = self._ensure_runtime_columns(self.raw_df)
+                self._clear_analysis_cache()
                 self._build_filter_cache()
                 self.apply_filters({}, "", True, True)
                 return True
@@ -1549,30 +1668,11 @@ class SettlementEngine:
             numeric_cols = APP_CONFIG["REVENUE_COLUMNS"] + ALL_COST_COLUMNS + APP_CONFIG["ADVANCE_COLUMNS"] + ["QTY_RECEIVED", "TARIFF"]
             self._coerce_numeric(df, numeric_cols)
             self._normalize_text(df, TEXT_COLUMNS)
-
-            if "SETTLEMENT_RUN" not in df.columns: df["SETTLEMENT_RUN"] = pd.NA
-                
-            run_numeric = pd.to_numeric(df["SETTLEMENT_RUN"], errors="coerce")
-            df["SETTLEMENT_STATUS"] = np.where(run_numeric.notna(), "Settled", "Pending")
-
-            def format_run(x):
-                if pd.isna(x) or str(x).lower() in ("nan", "<na>", "none", "unknown", ""): return "Unknown"
-                try: return str(int(float(x)))
-                except: return str(x).strip()
-
-            df["SETTLEMENT_RUN"] = df["SETTLEMENT_RUN"].apply(format_run)
-            df["RUN_STR"] = df["SETTLEMENT_RUN"]
-
-            lot_clean = df["LOT_ID"].astype(str).str.upper().str.rstrip("*")
-            df["Region"] = np.select([lot_clean.str.endswith("W"), lot_clean.str.endswith("E")], ["West", "East"], default="Unknown")
-
-            revenue_cols = [c for c in APP_CONFIG["REVENUE_COLUMNS"] if c in df.columns]
-            df["TOTAL_REVENUE"] = df[revenue_cols].sum(axis=1) if revenue_cols else 0.0
-
-            df["SEARCH_STRING"] = df[TEXT_COLUMNS].astype(str).agg(' '.join, axis=1).str.lower()
+            df = self._ensure_runtime_columns(df)
 
             self.raw_df = df
             self.save_cache()
+            self._clear_analysis_cache()
             self._build_filter_cache()
             
             self.apply_filters({}, "", True, True) 
@@ -1591,9 +1691,9 @@ class SettlementEngine:
             self.filter_cache = {}
             return
         def safe_unique(col: str) -> List[str]:
-            if col not in self.raw_df.columns: return []
-            vals = [str(x).strip() for x in self.raw_df[col].unique()]
-            return sorted(list(set([v for v in vals if v.lower() not in ("nan", "<na>", "none", "unknown", "")])))
+            if col not in self.raw_df.columns:
+                return []
+            return self._safe_sorted_unique(self.raw_df[col])
         
         self.filter_cache = {
             "SETTLEMENT_STATUS": safe_unique("SETTLEMENT_STATUS"), "Region": safe_unique("Region"),
@@ -1607,23 +1707,17 @@ class SettlementEngine:
         if self.raw_df.empty:
             self.filtered_df = pd.DataFrame()
             self.dynamic_full_df = pd.DataFrame()
+            self._clear_analysis_cache()
             return
 
         self.inc_adv = inc_adv
         self.inc_tar = inc_tar
         df_full = self.raw_df.copy()
 
-        active_rev = [c for c in APP_CONFIG.get("REVENUE_COLUMNS", []) if c in df_full.columns]
-        active_adv = [c for c in self.adv_cols if c in df_full.columns]
-        active_com = [c for c in self.comm_cols if c in df_full.columns]
-        active_tar = [c for c in self.tar_cols if c in df_full.columns]
-        active_opx = [c for c in self.opex_cols_map.keys() if c in df_full.columns]
-
-        df_full["_OPEX"] = df_full[active_opx].sum(axis=1) if active_opx else 0.0
-        df_full["_TARIFFS"] = df_full[active_tar].sum(axis=1) if active_tar else 0.0
-        df_full["_ADVANCES"] = df_full[active_adv].sum(axis=1) if active_adv else 0.0
-        df_full["_COMMISSIONS"] = df_full[active_com].sum(axis=1) if active_com else 0.0
-        df_full["TOTAL_REVENUE"] = df_full[active_rev].sum(axis=1) if active_rev else 0.0
+        df_full["_OPEX"] = df_full["_OPEX_BASE"] if "_OPEX_BASE" in df_full.columns else 0.0
+        df_full["_TARIFFS"] = df_full["_TARIFFS_BASE"] if "_TARIFFS_BASE" in df_full.columns else 0.0
+        df_full["_ADVANCES"] = df_full["_ADVANCES_BASE"] if "_ADVANCES_BASE" in df_full.columns else 0.0
+        df_full["_COMMISSIONS"] = df_full["_COMMISSIONS_BASE"] if "_COMMISSIONS_BASE" in df_full.columns else 0.0
 
         live_tariffs = df_full["_TARIFFS"] if self.inc_tar else 0.0
         live_advances = df_full["_ADVANCES"] if self.inc_adv else 0.0
@@ -1634,73 +1728,70 @@ class SettlementEngine:
         df_full["RETURN_PER_BOX"] = (df_full["NET_RETURN"] / df_full["QTY_RECEIVED"].replace(0, np.nan)).fillna(0.0)
 
         self.dynamic_full_df = df_full
-
-        df = df_full.copy()
-        for col, val in filter_dict.items():
-            if val != "All" and col in df.columns:
-                df = df[df[col] == val]
-
-        if search_text:
-            df = df[df["SEARCH_STRING"].str.contains(search_text.lower(), na=False)]
-
-        self.filtered_df = df
+        self.filtered_df = df_full.loc[self._build_mask(df_full, filter_dict, search_text)].copy()
+        self._clear_analysis_cache()
 
     def get_kpis(self) -> dict:
         if self.filtered_df.empty:
             return {"Total Boxes": 0, "Gross Sales": 0, "Total Costs": 0, "Net Return": 0, "Grower Return %": 0, "Cost / Box": 0, "Return / Box": 0, "Return / Box (No Tariff)": 0, "Operating Expenses": 0, "Total Advances": 0, "Total Tariffs": 0, "Avg Lot Return": 0, "Avg Grower Return": 0, "Total Growers": 0, "Total Lots": 0, "Total Commodities": 0, "Total Varieties": 0, "Commission Rev": 0, "Commission %": 0, "Comm / Box": 0, "Sales / FOB": 0}
+        def build_kpis() -> dict:
+            df = self.filtered_df
+            qty = float(df["QTY_RECEIVED"].sum())
+            revenue = float(df["TOTAL_REVENUE"].sum())
+            costs = float(df["TOTAL_COSTS"].sum())
+            net = float(df["NET_RETURN"].sum())
+            op_ex = float(df["_OPEX"].sum())
+            commissions = float(df["_COMMISSIONS"].sum())
+            display_advances = float(df["_ADVANCES"].sum())
+            display_tariff = float(df["_TARIFFS"].sum())
+            applied_tariff = display_tariff if self.inc_tar else 0.0
 
-        df = self.filtered_df
-        qty = float(df["QTY_RECEIVED"].sum())
-        revenue = float(df["TOTAL_REVENUE"].sum())
+            lot_returns = df.groupby("LOT_ID", observed=True)["NET_RETURN"].sum()
+            grower_returns = df.groupby("GROWER_NAME", observed=True)["NET_RETURN"].sum()
 
-        costs = float(df["TOTAL_COSTS"].sum())
-        net = float(df["NET_RETURN"].sum())
-        op_ex = float(df["_OPEX"].sum())
-        commissions = float(df["_COMMISSIONS"].sum())
-        
-        display_advances = float(df["_ADVANCES"].sum())
-        display_tariff = float(df["_TARIFFS"].sum())
-        
-        applied_tariff = display_tariff if self.inc_tar else 0.0
+            return {
+                "Total Boxes": qty, "Gross Sales": revenue, "Total Costs": costs, "Net Return": net,
+                "Grower Return %": (net / revenue if revenue != 0 else 0.0) * 100,
+                "Cost / Box": (costs / qty if qty != 0 else 0.0),
+                "Return / Box": (net / qty if qty != 0 else 0.0),
+                "Return / Box (No Tariff)": ((net + applied_tariff) / qty if qty != 0 else 0.0),
+                "Operating Expenses": op_ex, "Total Advances": display_advances, "Total Tariffs": display_tariff,
+                "Avg Lot Return": float(lot_returns.mean()) if not lot_returns.empty else 0.0,
+                "Avg Grower Return": float(grower_returns.mean()) if not grower_returns.empty else 0.0,
+                "Total Growers": df["GROWER_NAME"].nunique(), "Total Lots": df["LOT_ID"].nunique(),
+                "Total Commodities": df["COMMODITY"].nunique(), "Total Varieties": df["VARIETY"].nunique(),
+                "Commission Rev": commissions, "Commission %": (commissions / revenue if revenue != 0 else 0.0) * 100, "Comm / Box": (commissions / qty if qty != 0 else 0.0),
+                "Sales / FOB": (revenue / qty if qty != 0 else 0.0)
+            }
 
-        lot_avg = df.groupby("LOT_ID")["NET_RETURN"].sum().mean() if not df.empty and df["LOT_ID"].nunique() > 0 else 0.0
-        grower_avg = df.groupby("GROWER_NAME")["NET_RETURN"].sum().mean() if not df.empty and df["GROWER_NAME"].nunique() > 0 else 0.0
-
-        return {
-            "Total Boxes": qty, "Gross Sales": revenue, "Total Costs": costs, "Net Return": net,
-            "Grower Return %": (net / revenue if revenue != 0 else 0.0) * 100,
-            "Cost / Box": (costs / qty if qty != 0 else 0.0),
-            "Return / Box": (net / qty if qty != 0 else 0.0),
-            "Return / Box (No Tariff)": ((net + applied_tariff) / qty if qty != 0 else 0.0),
-            "Operating Expenses": op_ex, "Total Advances": display_advances, "Total Tariffs": display_tariff,
-            "Avg Lot Return": lot_avg, "Avg Grower Return": grower_avg,
-            "Total Growers": df["GROWER_NAME"].nunique(), "Total Lots": df["LOT_ID"].nunique(),
-            "Total Commodities": df["COMMODITY"].nunique(), "Total Varieties": df["VARIETY"].nunique(),
-            "Commission Rev": commissions, "Commission %": (commissions / revenue if revenue != 0 else 0.0) * 100, "Comm / Box": (commissions / qty if qty != 0 else 0.0),
-            "Sales / FOB": (revenue / qty if qty != 0 else 0.0)
-        }
+        return self._get_cached_result(("kpis", self.inc_adv, self.inc_tar), build_kpis)
 
     def get_profitability_by(self, group_by_cols: list) -> pd.DataFrame:
         if self.filtered_df.empty: return pd.DataFrame()
         group_by_cols = [c for c in group_by_cols if c in self.filtered_df.columns]
         if not group_by_cols: return pd.DataFrame()
+        def build_profitability() -> pd.DataFrame:
+            cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "_TARIFFS", "NET_RETURN", "_COMMISSIONS"] if c in self.filtered_df.columns]
+            grouped = self._grouped_sum(self.filtered_df, group_by_cols, cols_to_sum)
 
-        cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "_TARIFFS", "NET_RETURN", "_COMMISSIONS"] if c in self.filtered_df.columns]
-        grouped = self.filtered_df.groupby(group_by_cols, as_index=False)[cols_to_sum].sum()
+            for col in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "_TARIFFS", "NET_RETURN", "_COMMISSIONS"]:
+                if col not in grouped.columns:
+                    grouped[col] = 0.0
 
-        for col in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "_TARIFFS", "NET_RETURN", "_COMMISSIONS"]:
-            if col not in grouped.columns: grouped[col] = 0.0
+            qty = grouped["QTY_RECEIVED"]
+            revenue = grouped["TOTAL_REVENUE"]
+            grouped["Grower_Ret_%"] = self._safe_divide(grouped["NET_RETURN"], revenue) * 100
+            grouped["Cost_Per_Box"] = self._safe_divide(grouped["TOTAL_COSTS"], qty)
+            grouped["Return_Per_Box"] = self._safe_divide(grouped["NET_RETURN"], qty)
+            grouped["Return_No_Tariff"] = self._safe_divide(grouped["NET_RETURN"] + grouped["_TARIFFS"], qty)
+            grouped["Commission_%"] = self._safe_divide(grouped["_COMMISSIONS"], revenue) * 100
+            grouped["Comm_Per_Box"] = self._safe_divide(grouped["_COMMISSIONS"], qty)
 
-        grouped["Grower_Ret_%"] = (grouped["NET_RETURN"] / grouped["TOTAL_REVENUE"].replace(0, np.nan)).fillna(0) * 100
-        grouped["Cost_Per_Box"] = (grouped["TOTAL_COSTS"] / grouped["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
-        grouped["Return_Per_Box"] = (grouped["NET_RETURN"] / grouped["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
-        grouped["Return_No_Tariff"] = ((grouped["NET_RETURN"] + grouped["_TARIFFS"]) / grouped["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
-        grouped["Commission_%"] = (grouped["_COMMISSIONS"] / grouped["TOTAL_REVENUE"].replace(0, np.nan)).fillna(0) * 100
-        grouped["Comm_Per_Box"] = (grouped["_COMMISSIONS"] / grouped["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
+            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "_TARIFFS": "Tariff"})
+            grouped = grouped.drop(columns=["_COMMISSIONS"], errors="ignore")
+            return grouped.sort_values(by="Net_Return", ascending=False)
 
-        grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "_TARIFFS": "Tariff"})
-        grouped = grouped.drop(columns=["_COMMISSIONS"], errors="ignore")
-        return grouped.sort_values(by="Net_Return", ascending=False)
+        return self._get_cached_result(("profitability", tuple(group_by_cols), self.inc_adv, self.inc_tar), build_profitability)
 
     def get_tag_analysis(self) -> pd.DataFrame:
         if self.filtered_df.empty: return pd.DataFrame()
@@ -1708,109 +1799,120 @@ class SettlementEngine:
         
         cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
         cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + cost_cols_found if c in self.filtered_df.columns]
-        
-        grouped = self.filtered_df.groupby(group_cols, as_index=False)[cols_to_sum].sum()
-        grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "TARIFF": "Tariff"})
 
-        qty = grouped["Qty"].to_numpy() if "Qty" in grouped.columns else np.array([])
-        sales = grouped["Gross_Sales"].to_numpy() if "Gross_Sales" in grouped.columns else np.array([])
-        costs = grouped["Total_Costs"].to_numpy() if "Total_Costs" in grouped.columns else np.array([])
-        net = grouped["Net_Return"].to_numpy() if "Net_Return" in grouped.columns else np.array([])
-        comm = grouped["_COMMISSIONS"].to_numpy() if "_COMMISSIONS" in grouped.columns else np.array([])
+        def build_tag_analysis() -> pd.DataFrame:
+            grouped = self._grouped_sum(self.filtered_df, group_cols, cols_to_sum)
+            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "TARIFF": "Tariff"})
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            grouped["Grower_Ret_%"] = np.divide(net, sales, out=np.zeros_like(net, dtype=float), where=sales!=0) * 100
-            grouped["Cost_Per_Box"] = np.divide(costs, qty, out=np.zeros_like(costs, dtype=float), where=qty!=0)
-            grouped["Return_Per_Box"] = np.divide(net, qty, out=np.zeros_like(net, dtype=float), where=qty!=0)
+            qty = grouped["Qty"] if "Qty" in grouped.columns else pd.Series(dtype=float)
+            sales = grouped["Gross_Sales"] if "Gross_Sales" in grouped.columns else pd.Series(dtype=float)
+            costs = grouped["Total_Costs"] if "Total_Costs" in grouped.columns else pd.Series(dtype=float)
+            net = grouped["Net_Return"] if "Net_Return" in grouped.columns else pd.Series(dtype=float)
+            comm = grouped["_COMMISSIONS"] if "_COMMISSIONS" in grouped.columns else pd.Series(dtype=float)
+
+            grouped["Grower_Ret_%"] = self._safe_divide(net, sales) * 100
+            grouped["Cost_Per_Box"] = self._safe_divide(costs, qty)
+            grouped["Return_Per_Box"] = self._safe_divide(net, qty)
             grouped["Commission_Rev"] = comm
-            grouped["Commission_%"] = np.divide(comm, sales, out=np.zeros_like(comm, dtype=float), where=sales!=0) * 100
-            grouped["Comm_Per_Box"] = np.divide(comm, qty, out=np.zeros_like(comm, dtype=float), where=qty!=0)
+            grouped["Commission_%"] = self._safe_divide(comm, sales) * 100
+            grouped["Comm_Per_Box"] = self._safe_divide(comm, qty)
 
-        cost_cols_cleaned = [c for c in cost_cols_found if c != "TARIFF"]
-        final_cols = group_cols + ["Qty", "Gross_Sales", "Total_Costs", "Tariff", "Net_Return", "Grower_Ret_%", "Cost_Per_Box", "Return_Per_Box", "Commission_Rev", "Commission_%", "Comm_Per_Box"] + cost_cols_cleaned
-        final_cols = [c for c in final_cols if c in grouped.columns]
+            cost_cols_cleaned = [c for c in cost_cols_found if c != "TARIFF"]
+            final_cols = group_cols + ["Qty", "Gross_Sales", "Total_Costs", "Tariff", "Net_Return", "Grower_Ret_%", "Cost_Per_Box", "Return_Per_Box", "Commission_Rev", "Commission_%", "Comm_Per_Box"] + cost_cols_cleaned
+            final_cols = [c for c in final_cols if c in grouped.columns]
 
-        if "LOT_ID" in grouped.columns and "PALLET_TAG_ID" in grouped.columns:
-            return grouped[final_cols].sort_values(by=["LOT_ID", "PALLET_TAG_ID"])
-        return grouped[final_cols]
+            if "LOT_ID" in grouped.columns and "PALLET_TAG_ID" in grouped.columns:
+                return grouped[final_cols].sort_values(by=["LOT_ID", "PALLET_TAG_ID"])
+            return grouped[final_cols]
+
+        return self._get_cached_result(("tag_analysis", self.inc_adv, self.inc_tar), build_tag_analysis)
 
     def get_cost_breakdown(self, active_only=False) -> pd.DataFrame:
         if self.filtered_df.empty: return pd.DataFrame()
-        qty = float(self.filtered_df["QTY_RECEIVED"].sum())
-        cost_data = []
+        def build_cost_breakdown() -> pd.DataFrame:
+            qty = float(self.filtered_df["QTY_RECEIVED"].sum())
+            cost_data = []
 
-        for col, category in self.opex_cols_map.items():
-            if col in self.filtered_df.columns:
-                total_amount = float(self.filtered_df[col].sum())
-                if total_amount != 0:
-                    cost_data.append({"Category": category, "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
-
-        for col in self.comm_cols:
-            if col in self.filtered_df.columns:
-                total_amount = float(self.filtered_df[col].sum())
-                if total_amount != 0:
-                    cost_data.append({"Category": "Commissions", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
-
-        if not active_only or self.inc_tar:
-            for col in self.tar_cols:
+            for col, category in self.opex_cols_map.items():
                 if col in self.filtered_df.columns:
                     total_amount = float(self.filtered_df[col].sum())
                     if total_amount != 0:
-                        cost_data.append({"Category": "Tariffs", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
+                        cost_data.append({"Category": category, "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
 
-        if not active_only or self.inc_adv:
-            for col in self.adv_cols:
+            for col in self.comm_cols:
                 if col in self.filtered_df.columns:
                     total_amount = float(self.filtered_df[col].sum())
                     if total_amount != 0:
-                        cost_data.append({"Category": "Advances", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
+                        cost_data.append({"Category": "Commissions", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
 
-        return pd.DataFrame(cost_data).sort_values(by="Total Amount", ascending=False) if cost_data else pd.DataFrame()
+            if not active_only or self.inc_tar:
+                for col in self.tar_cols:
+                    if col in self.filtered_df.columns:
+                        total_amount = float(self.filtered_df[col].sum())
+                        if total_amount != 0:
+                            cost_data.append({"Category": "Tariffs", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
+
+            if not active_only or self.inc_adv:
+                for col in self.adv_cols:
+                    if col in self.filtered_df.columns:
+                        total_amount = float(self.filtered_df[col].sum())
+                        if total_amount != 0:
+                            cost_data.append({"Category": "Advances", "Charge Name": col, "Total Units": qty, "Total Amount": total_amount, "Cost / Box": (total_amount / qty if qty != 0 else 0.0)})
+
+            return pd.DataFrame(cost_data).sort_values(by="Total Amount", ascending=False) if cost_data else pd.DataFrame()
+
+        return self._get_cached_result(("cost_breakdown", active_only, self.inc_adv, self.inc_tar), build_cost_breakdown)
 
     def get_lot_details(self, lot_id: str) -> dict:
         if not hasattr(self, 'dynamic_full_df') or self.dynamic_full_df.empty: return {}
-        df = self.dynamic_full_df[self.dynamic_full_df["LOT_ID"] == str(lot_id)]
-        if df.empty: return {}
+        def build_lot_details() -> dict:
+            df = self.dynamic_full_df[self.dynamic_full_df["LOT_ID"] == str(lot_id)]
+            if df.empty:
+                return {}
 
-        qty = float(df["QTY_RECEIVED"].sum())
-        revenue = float(df["TOTAL_REVENUE"].sum())
+            qty = float(df["QTY_RECEIVED"].sum())
+            revenue = float(df["TOTAL_REVENUE"].sum())
 
-        sales_cols = [c for c in ["COMMODITY", "VARIETY", "STYLE", "SIZENAME", "GRADE"] if c in df.columns]
-        sales_breakdown = []
-        if sales_cols:
-            grouped_sales = df.groupby(sales_cols, as_index=False)[["QTY_RECEIVED", "TOTAL_REVENUE"]].sum()
-            for _, row in grouped_sales.iterrows():
-                s_qty = float(row["QTY_RECEIVED"])
-                s_rev = float(row["TOTAL_REVENUE"])
-                if s_rev != 0 or s_qty != 0:
-                    parts = [str(row[c]) for c in sales_cols if str(row[c]) not in ("Unknown", "", "nan", "None")]
-                    descr = " | ".join(parts) if parts else "Gross Sales"
-                    avg_price = s_rev / s_qty if s_qty != 0 else 0.0
-                    sales_breakdown.append({"description": descr, "qty": s_qty, "amount": s_rev, "avg_price": avg_price})
+            sales_cols = [c for c in ["COMMODITY", "VARIETY", "STYLE", "SIZENAME", "GRADE"] if c in df.columns]
+            sales_breakdown = []
+            if sales_cols:
+                grouped_sales = df.groupby(sales_cols, as_index=False, observed=True)[["QTY_RECEIVED", "TOTAL_REVENUE"]].sum()
+                for row in grouped_sales.itertuples(index=False):
+                    s_qty = float(row.QTY_RECEIVED)
+                    s_rev = float(row.TOTAL_REVENUE)
+                    if s_rev != 0 or s_qty != 0:
+                        parts = [str(getattr(row, c)) for c in sales_cols if str(getattr(row, c)) not in ("Unknown", "", "nan", "None")]
+                        descr = " | ".join(parts) if parts else "Gross Sales"
+                        avg_price = s_rev / s_qty if s_qty != 0 else 0.0
+                        sales_breakdown.append({"description": descr, "qty": s_qty, "amount": s_rev, "avg_price": avg_price})
 
-        individual_costs = {}
-        valid_cols = list(self.opex_cols_map.keys()) + self.comm_cols
-        if self.inc_tar: valid_cols.extend(self.tar_cols)
-        if self.inc_adv: valid_cols.extend(self.adv_cols)
-        
-        for col in valid_cols:
-            if col in df.columns:
-                amt = float(df[col].sum())
-                if amt != 0: 
-                    individual_costs[col] = amt
+            individual_costs = {}
+            valid_cols = list(self.opex_cols_map.keys()) + self.comm_cols
+            if self.inc_tar:
+                valid_cols.extend(self.tar_cols)
+            if self.inc_adv:
+                valid_cols.extend(self.adv_cols)
 
-        total_costs = float(df["TOTAL_COSTS"].sum()) if "TOTAL_COSTS" in df.columns else 0.0
-        net = float(df["NET_RETURN"].sum()) if "NET_RETURN" in df.columns else 0.0
-        commission = float(df["_COMMISSIONS"].sum()) if "_COMMISSIONS" in df.columns else 0.0
+            for col in valid_cols:
+                if col in df.columns:
+                    amt = float(df[col].sum())
+                    if amt != 0:
+                        individual_costs[col] = amt
 
-        return {
-            "Grower": str(df["GROWER_NAME"].iloc[0]), "Commodity": str(df["COMMODITY"].iloc[0]),
-            "Status": str(df["SETTLEMENT_STATUS"].iloc[0]), "Region": str(df["Region"].iloc[0]),
-            "Qty": qty, "Gross Sales": revenue, "Sales Breakdown": sales_breakdown,
-            "Individual Costs": individual_costs, "Total Costs": total_costs, "Net Return": net,
-            "Grower Return %": (net / revenue if revenue != 0 else 0.0) * 100, "Return / Box": (net / qty if qty != 0 else 0.0),
-            "Commission Rev": commission, "Commission %": (commission / revenue if revenue != 0 else 0.0) * 100, "Comm / Box": (commission / qty if qty != 0 else 0.0)
-        }
+            total_costs = float(df["TOTAL_COSTS"].sum()) if "TOTAL_COSTS" in df.columns else 0.0
+            net = float(df["NET_RETURN"].sum()) if "NET_RETURN" in df.columns else 0.0
+            commission = float(df["_COMMISSIONS"].sum()) if "_COMMISSIONS" in df.columns else 0.0
+
+            return {
+                "Grower": str(df["GROWER_NAME"].iloc[0]), "Commodity": str(df["COMMODITY"].iloc[0]),
+                "Status": str(df["SETTLEMENT_STATUS"].iloc[0]), "Region": str(df["Region"].iloc[0]),
+                "Qty": qty, "Gross Sales": revenue, "Sales Breakdown": sales_breakdown,
+                "Individual Costs": individual_costs, "Total Costs": total_costs, "Net Return": net,
+                "Grower Return %": (net / revenue if revenue != 0 else 0.0) * 100, "Return / Box": (net / qty if qty != 0 else 0.0),
+                "Commission Rev": commission, "Commission %": (commission / revenue if revenue != 0 else 0.0) * 100, "Comm / Box": (commission / qty if qty != 0 else 0.0)
+            }
+
+        return self._get_cached_result(("lot_details", str(lot_id), self.inc_adv, self.inc_tar), build_lot_details)
 
     def get_grower_benchmarking(self) -> pd.DataFrame:
         df = self.get_profitability_by(["GROWER_NAME"])
@@ -1829,12 +1931,22 @@ class SettlementEngine:
         if self.filtered_df.empty: return pd.DataFrame()
         profile_cols = ["COMMODITY", "VARIETY", "STYLE", "SIZENAME", "COLOR", "GRADE"]
         valid_cols = [c for c in profile_cols if c in self.filtered_df.columns]
-        market = self.dynamic_full_df.groupby(valid_cols, as_index=False).apply(lambda x: pd.Series({"Market_Avg_Return": x["NET_RETURN"].sum() / x["QTY_RECEIVED"].sum() if x["QTY_RECEIVED"].sum() != 0 else 0}))
-        growers = self.filtered_df.groupby(valid_cols + ["GROWER_NAME"], as_index=False).apply(lambda x: pd.Series({"Qty": x["QTY_RECEIVED"].sum(), "Grower_Return": x["NET_RETURN"].sum() / x["QTY_RECEIVED"].sum() if x["QTY_RECEIVED"].sum() != 0 else 0}))
-        merged = pd.merge(growers, market, on=valid_cols, how="left")
-        merged["Variance_Dollar"] = merged["Grower_Return"] - merged["Market_Avg_Return"]
-        merged["Variance_%"] = (merged["Variance_Dollar"] / merged["Market_Avg_Return"].replace(0, np.nan)).fillna(0) * 100
-        return merged[merged["Qty"] > 0].sort_values("Variance_Dollar", ascending=False)
+        def build_price_variance() -> pd.DataFrame:
+            market = self._grouped_sum(self.dynamic_full_df, valid_cols, ["NET_RETURN", "QTY_RECEIVED"])
+            market["Market_Avg_Return"] = self._safe_divide(market["NET_RETURN"], market["QTY_RECEIVED"])
+            market = market[valid_cols + ["Market_Avg_Return"]]
+
+            grower_group_cols = valid_cols + ["GROWER_NAME"]
+            growers = self._grouped_sum(self.filtered_df, grower_group_cols, ["QTY_RECEIVED", "NET_RETURN"])
+            growers = growers.rename(columns={"QTY_RECEIVED": "Qty"})
+            growers["Grower_Return"] = self._safe_divide(growers["NET_RETURN"], growers["Qty"])
+
+            merged = pd.merge(growers, market, on=valid_cols, how="left")
+            merged["Variance_Dollar"] = merged["Grower_Return"] - merged["Market_Avg_Return"]
+            merged["Variance_%"] = self._safe_divide(merged["Variance_Dollar"], merged["Market_Avg_Return"]) * 100
+            return merged[merged["Qty"] > 0].sort_values("Variance_Dollar", ascending=False)
+
+        return self._get_cached_result(("price_variance", tuple(valid_cols), self.inc_adv, self.inc_tar), build_price_variance)
 
     def get_market_benchmarks(self) -> pd.DataFrame:
         if not hasattr(self, 'dynamic_full_df') or self.dynamic_full_df.empty: return pd.DataFrame()
@@ -1844,7 +1956,10 @@ class SettlementEngine:
             rets = rets[rets > 0]
             if len(rets) == 0: return pd.Series({"Median": 0, "Top_25%": 0, "Bottom_25%": 0})
             return pd.Series({"Median": np.median(rets), "Top_25%": np.percentile(rets, 75), "Bottom_25%": np.percentile(rets, 25)})
-        return self.dynamic_full_df.groupby(valid_cols).apply(calc_bmarks).reset_index()
+        return self._get_cached_result(
+            ("market_benchmarks", tuple(valid_cols), self.inc_adv, self.inc_tar),
+            lambda: self.dynamic_full_df.groupby(valid_cols, observed=True).apply(calc_bmarks).reset_index()
+        )
 
     def get_outlier_analysis(self) -> pd.DataFrame:
         if self.filtered_df.empty: return pd.DataFrame()
@@ -1893,13 +2008,15 @@ class SettlementEngine:
         if self.filtered_df.empty: return pd.DataFrame()
         df = self.get_profitability_by(["LOT_ID", "GROWER_NAME", "COMMODITY"])
         if df.empty: return df
-        market = self.dynamic_full_df.groupby("COMMODITY", as_index=False).apply(
-            lambda x: pd.Series({"Expected_Return": x["NET_RETURN"].sum() / x["QTY_RECEIVED"].sum() if x["QTY_RECEIVED"].sum() != 0 else 0})
-        )
-        merged = pd.merge(df, market, on="COMMODITY", how="left")
-        merged["Variance_$"] = merged["Return_Per_Box"] - merged["Expected_Return"]
-        merged["Variance_%"] = (merged["Variance_$"] / merged["Expected_Return"].replace(0, np.nan)).fillna(0) * 100
-        return merged[["LOT_ID", "GROWER_NAME", "COMMODITY", "Expected_Return", "Return_Per_Box", "Variance_$", "Variance_%"]].sort_values("Variance_$", ascending=True)
+        def build_return_variance() -> pd.DataFrame:
+            market = self._grouped_sum(self.dynamic_full_df, ["COMMODITY"], ["NET_RETURN", "QTY_RECEIVED"])
+            market["Expected_Return"] = self._safe_divide(market["NET_RETURN"], market["QTY_RECEIVED"])
+            merged = pd.merge(df, market[["COMMODITY", "Expected_Return"]], on="COMMODITY", how="left")
+            merged["Variance_$"] = merged["Return_Per_Box"] - merged["Expected_Return"]
+            merged["Variance_%"] = self._safe_divide(merged["Variance_$"], merged["Expected_Return"]) * 100
+            return merged[["LOT_ID", "GROWER_NAME", "COMMODITY", "Expected_Return", "Return_Per_Box", "Variance_$", "Variance_%"]].sort_values("Variance_$", ascending=True)
+
+        return self._get_cached_result(("return_variance", self.inc_adv, self.inc_tar), build_return_variance)
 
     def get_product_dna_analysis(self) -> pd.DataFrame: return self.get_product_intelligence()
 
@@ -1924,40 +2041,38 @@ class PandasModel(QAbstractTableModel):
         super().__init__(parent)
         self._df = data
         self._columns = []
-        self._values = []
         self._set_data(data)
 
     def _set_data(self, data: pd.DataFrame):
         self.beginResetModel()
         self._df = data
         if data is None or data.empty:
-            self._columns, self._values = [], []
+            self._columns = []
         else:
             self._columns = data.columns.tolist()
-            self._values = data.values.tolist()
         self.endResetModel()
         
     def get_dataframe(self) -> pd.DataFrame:
         return self._df
 
-    def rowCount(self, parent=QModelIndex()): return len(self._values)
+    def rowCount(self, parent=QModelIndex()): return 0 if self._df is None else len(self._df.index)
     def columnCount(self, parent=QModelIndex()): return len(self._columns)
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid(): return None
-        val = self._values[index.row()][index.column()]
+        val = self._df.iat[index.row(), index.column()]
 
         if role == Qt.ItemDataRole.DisplayRole:
             if pd.isna(val) or val == "": return ""
-            col_name = str(self._columns[index.column()]).upper()
-            if "RUN" in col_name:
+            col_name = self._columns[index.column()]
+            if is_run_column(col_name):
                 try: return str(int(float(val)))
                 except: return str(val)
-            if "QTY" in col_name or "QUANTITY" in col_name or "VOLUME" in col_name or "UNITS" in col_name:
+            if is_whole_number_column(col_name):
                 try: return f"{float(val):,.0f}"
                 except: return str(val)
             if isinstance(val, (int, float, np.integer, np.floating)):
-                if "MARGIN" in col_name or "%" in col_name or "SCORE" in col_name or "RANK" in col_name or "RET_%" in col_name: 
+                if is_percent_column(col_name): 
                     return f"{float(val):,.2f}%"
                 return f"{float(val):,.2f}"
             return str(val)
@@ -2002,6 +2117,18 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                     letter = chr(65 + remainder) + letter
                     
                 worksheet.column_dimensions[letter].width = min(max_len, 50)
+                if is_run_column(col):
+                    for cell in worksheet[letter][1:]:
+                        cell.number_format = "0"
+                elif is_whole_number_column(col):
+                    for cell in worksheet[letter][1:]:
+                        cell.number_format = "#,##0"
+                elif is_percent_column(col):
+                    for cell in worksheet[letter][1:]:
+                        cell.number_format = '0.00"%"'
+                elif pd.api.types.is_numeric_dtype(series):
+                    for cell in worksheet[letter][1:]:
+                        cell.number_format = "#,##0.00"
         QMessageBox.information(parent_widget, "Success", f"Data exported successfully to\n{file_name}")
     except Exception as e:
         QMessageBox.critical(parent_widget, "Export Error", f"Failed to export data:\n{str(e)}")
@@ -2086,8 +2213,10 @@ class GenericAnalysisWindow(QDialog):
         table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        table.setModel(QSortFilterProxyModel())
-        table.model().setSourceModel(PandasModel(df_summary, parent=table))
+        proxy = QSortFilterProxyModel(table)
+        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSourceModel(PandasModel(df_summary, parent=table))
+        table.setModel(proxy)
         
         if parent and hasattr(parent, 'handle_dialog_drilldown'):
             table.doubleClicked.connect(lambda idx, t=table: parent.handle_dialog_drilldown(idx, t))
@@ -2115,8 +2244,10 @@ class TagDetailDialog(QDialog):
         table = QTableView()
         table.setAlternatingRowColors(True)
         table.setStyleSheet("QTableView { background-color: white; alternate-background-color: #fbfbfb; border: 1px solid #e1e8ed; }")
-        table.setModel(QSortFilterProxyModel())
-        table.model().setSourceModel(PandasModel(df_tag, parent=table))
+        proxy = QSortFilterProxyModel(table)
+        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSourceModel(PandasModel(df_tag, parent=table))
+        table.setModel(proxy)
         layout.addWidget(table)
 
 class LotDetailDialog(QDialog):
@@ -2242,7 +2373,7 @@ class GrowerPerformanceDetailDialog(QDialog):
         lbl_mix.setStyleSheet("font-size: 14px; margin-top: 15px; color: #334155;")
         layout.addWidget(lbl_mix)
         
-        mix_df = df.groupby("COMMODITY", as_index=False)[["QTY_RECEIVED", "TOTAL_REVENUE", "NET_RETURN"]].sum()
+        mix_df = df.groupby("COMMODITY", as_index=False, observed=True)[["QTY_RECEIVED", "TOTAL_REVENUE", "NET_RETURN"]].sum()
         mix_df["Return/Box"] = (mix_df["NET_RETURN"] / mix_df["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
         mix_df = mix_df.sort_values("QTY_RECEIVED", ascending=False)
         
@@ -2322,8 +2453,10 @@ class ChartDetailDialog(QDialog):
         table.setAlternatingRowColors(True)
         table.setStyleSheet("QTableView { background-color: white; alternate-background-color: #fbfbfb; border: 1px solid #e1e8ed; }")
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        table.setModel(QSortFilterProxyModel())
-        table.model().setSourceModel(PandasModel(df, parent=table))
+        proxy = QSortFilterProxyModel(table)
+        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSourceModel(PandasModel(df, parent=table))
+        table.setModel(proxy)
         layout.addWidget(table)
         
         btn_layout = QHBoxLayout()
@@ -2501,6 +2634,7 @@ class MainWindow(QMainWindow):
             "Executive Scorecards": 16, "Lot Analysis": 17,
             "Tag Analysis": 18, "Cost Analysis": 19
         }
+        self.page_names_by_index = {idx: page_name for page_name, idx in self.pages_map.items()}
 
         self.stacked_widget = QStackedWidget()
         self.tables = {}
@@ -2738,6 +2872,8 @@ class MainWindow(QMainWindow):
                 btn.setStyleSheet("QPushButton { text-align: left; padding: 10px 10px 10px 15px; font-size: 14px; background-color: #3b82f6; color: white; border: none; font-weight: bold; border-left: 5px solid #60a5fa; }")
             else:
                 btn.setStyleSheet("QPushButton { text-align: left; padding: 10px 10px 10px 15px; font-size: 13px; background-color: transparent; color: #cbd5e1; border: none; } QPushButton:hover { background-color: #334155; color: white; }")
+        if not self.engine.raw_df.empty and index not in (0, 1):
+            self.refresh_current_page_table()
 
     def setup_original_dashboard(self, layout):
         kpi_row1, kpi_row2, kpi_row3 = QHBoxLayout(), QHBoxLayout(), QHBoxLayout()
@@ -2905,8 +3041,10 @@ class MainWindow(QMainWindow):
         table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         table.setSortingEnabled(True)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        table.setModel(QSortFilterProxyModel())
-        table.model().setSourceModel(PandasModel(df, parent=table))
+        proxy = QSortFilterProxyModel(table)
+        proxy.setSortRole(Qt.ItemDataRole.EditRole)
+        proxy.setSourceModel(PandasModel(df, parent=table))
+        table.setModel(proxy)
         layout.addWidget(table)
         
         btn_layout = QHBoxLayout()
@@ -2997,13 +3135,12 @@ class MainWindow(QMainWindow):
             inc_tar = self.cb_inc_tariffs.isChecked()
 
             def get_valid_options(col_name):
-                temp_df = self.engine.raw_df
+                raw_df = self.engine.raw_df
+                mask = pd.Series(True, index=raw_df.index)
                 for k, v in active_filters.items():
-                    if k != col_name and v != "All":
-                        temp_df = temp_df[temp_df[k] == v]
-                vals = [str(x).strip() for x in temp_df[col_name].unique()]
-                clean_vals = sorted(list(set([v for v in vals if v.lower() not in ("nan", "<na>", "none", "unknown", "")])))
-                return ["All"] + clean_vals
+                    if k != col_name and v != "All" and k in raw_df.columns:
+                        mask &= raw_df[k].eq(v)
+                return ["All"] + self.engine._safe_sorted_unique(raw_df.loc[mask, col_name])
 
             for col, cb in self.combos.items():
                 cb.blockSignals(True)
@@ -3030,24 +3167,24 @@ class MainWindow(QMainWindow):
         if self.engine.filtered_df.empty: return
         
         kpis = self.engine.get_kpis()
-        self.kpi_ex_sales.value_label.setText(f"${kpis['Gross Sales']:,.0f}")
-        self.kpi_ex_exp.value_label.setText(f"${kpis['Total Costs']:,.0f}")
-        self.kpi_ex_opex.value_label.setText(f"${kpis['Operating Expenses']:,.0f}")
-        self.kpi_ex_adv.value_label.setText(f"${kpis['Total Advances']:,.0f}")
-        self.kpi_ex_tar.value_label.setText(f"${kpis['Total Tariffs']:,.0f}")
+        self.kpi_ex_sales.value_label.setText(f"${kpis['Gross Sales']:,.2f}")
+        self.kpi_ex_exp.value_label.setText(f"${kpis['Total Costs']:,.2f}")
+        self.kpi_ex_opex.value_label.setText(f"${kpis['Operating Expenses']:,.2f}")
+        self.kpi_ex_adv.value_label.setText(f"${kpis['Total Advances']:,.2f}")
+        self.kpi_ex_tar.value_label.setText(f"${kpis['Total Tariffs']:,.2f}")
 
-        self.kpi_ex_net.value_label.setText(f"${kpis['Net Return']:,.0f}")
+        self.kpi_ex_net.value_label.setText(f"${kpis['Net Return']:,.2f}")
         self.kpi_ex_cpb.value_label.setText(f"${kpis['Cost / Box']:.2f}")
         self.kpi_ex_rpb.value_label.setText(f"${kpis['Return / Box']:.2f}")
         self.kpi_ex_rpb_notariff.value_label.setText(f"${kpis['Return / Box (No Tariff)']:.2f}")
         
-        self.kpi_ex_alr.value_label.setText(f"${kpis['Avg Lot Return']:,.0f}")
+        self.kpi_ex_alr.value_label.setText(f"${kpis['Avg Lot Return']:,.2f}")
         
-        self.kpi_ex_comm.value_label.setText(f"${kpis['Commission Rev']:,.0f}")
+        self.kpi_ex_comm.value_label.setText(f"${kpis['Commission Rev']:,.2f}")
         self.kpi_ex_comm_pct.value_label.setText(f"{kpis['Commission %']:.1f}%")
         self.kpi_ex_comm_pb.value_label.setText(f"${kpis['Comm / Box']:.2f}")
         
-        self.kpi_ex_agr.value_label.setText(f"${kpis['Avg Grower Return']:,.0f}")
+        self.kpi_ex_agr.value_label.setText(f"${kpis['Avg Grower Return']:,.2f}")
         
         self.kpi_ex_qty.value_label.setText(f"{kpis['Total Boxes']:,.0f}")
         self.kpi_ex_fob.value_label.setText(f"${kpis['Sales / FOB']:.2f}")
@@ -3067,10 +3204,9 @@ class MainWindow(QMainWindow):
         if not comm_df.empty:
             series = QBarSeries()
             bar_set = QBarSet("Net Return")
-            categories = []
-            for _, row in comm_df.iterrows():
-                categories.append(str(row["COMMODITY"]))
-                bar_set.append(float(row["Net_Return"]))
+            categories = comm_df["COMMODITY"].astype(str).tolist()
+            for value in comm_df["Net_Return"].astype(float).tolist():
+                bar_set.append(value)
             series.append(bar_set)
             
             self.chart_commodity.addSeries(series)
@@ -3089,18 +3225,17 @@ class MainWindow(QMainWindow):
         if not cost_df.empty:
             if len(cost_df) <= 8:
                 pie_series = QPieSeries()
-                for _, row in cost_df.iterrows():
-                    pie_series.append(str(row["Charge Name"]), float(row["Total Amount"]))
+                for charge_name, total_amount in cost_df[["Charge Name", "Total Amount"]].itertuples(index=False, name=None):
+                    pie_series.append(str(charge_name), float(total_amount))
                 pie_series.setLabelsVisible(True)
                 self.chart_costs.addSeries(pie_series)
             else:
                 h_series = QHorizontalBarSeries()
                 bar_set = QBarSet("Total Amount")
-                categories = []
                 cost_df_rev = cost_df.sort_values("Total Amount", ascending=True)
-                for _, row in cost_df_rev.iterrows():
-                    categories.append(str(row["Charge Name"]))
-                    bar_set.append(float(row["Total Amount"]))
+                categories = cost_df_rev["Charge Name"].astype(str).tolist()
+                for value in cost_df_rev["Total Amount"].astype(float).tolist():
+                    bar_set.append(value)
                 h_series.append(bar_set)
                 
                 self.chart_costs.addSeries(h_series)
@@ -3111,6 +3246,39 @@ class MainWindow(QMainWindow):
                 axisX = QValueAxis()
                 self.chart_costs.addAxis(axisX, Qt.AlignmentFlag.AlignBottom)
                 h_series.attachAxis(axisX)
+
+    def get_page_dataframe(self, page_name: str) -> pd.DataFrame:
+        builders = {
+            "Grower Analysis": lambda: self.engine.get_profitability_by(["GROWER_NAME"]),
+            "Grower Benchmarking": self.engine.get_grower_benchmarking,
+            "Grower Performance Scorecard": self.engine.get_grower_performance_scorecard,
+            "Product Analysis": lambda: self.engine.get_profitability_by(["COMMODITY", "VARIETY"]),
+            "Product Intelligence": self.engine.get_product_intelligence,
+            "Product DNA Analysis": self.engine.get_product_dna_analysis,
+            "Variety Performance": self.engine.get_variety_performance,
+            "Attribute Analysis": self.engine.get_attribute_analysis,
+            "Price Variance Analysis": self.engine.get_price_variance_analysis,
+            "Return Variance Explanation": self.engine.get_return_variance_explanation,
+            "Market Benchmarking": self.engine.get_market_benchmarks,
+            "Outlier Detection": self.engine.get_outlier_analysis,
+            "Opportunity Finder": self.engine.get_opportunity_finder,
+            "Profitability Drivers": self.engine.get_profitability_drivers,
+            "Executive Scorecards": self.engine.get_executive_scorecards,
+            "Lot Analysis": lambda: self.engine.get_profitability_by(["LOT_ID", "Region", "SETTLEMENT_STATUS", "GROWER_NAME", "COMMODITY"]),
+            "Tag Analysis": self.engine.get_tag_analysis,
+            "Cost Analysis": lambda: self.engine.get_cost_breakdown(active_only=True),
+        }
+        if page_name not in builders:
+            return pd.DataFrame()
+        if page_name not in self.engine.current_page_cache:
+            self.engine.current_page_cache[page_name] = builders[page_name]()
+        return self.engine.current_page_cache[page_name].copy(deep=True)
+
+    def refresh_current_page_table(self):
+        page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex())
+        if not page_name or page_name not in self.tables:
+            return
+        self.update_table(self.tables[page_name], self.get_page_dataframe(page_name))
 
     def update_dashboard(self):
         try:
@@ -3130,31 +3298,7 @@ class MainWindow(QMainWindow):
             self.kpi_comm_pb.value_label.setText(f"${kpis['Comm / Box']:,.2f}")
 
             self.update_charts()
-
-            tables_data = {
-                "Grower Analysis": self.engine.get_profitability_by(["GROWER_NAME"]),
-                "Grower Benchmarking": self.engine.get_grower_benchmarking(),
-                "Grower Performance Scorecard": self.engine.get_grower_performance_scorecard(),
-                "Product Analysis": self.engine.get_profitability_by(["COMMODITY", "VARIETY"]),
-                "Product Intelligence": self.engine.get_product_intelligence(),
-                "Product DNA Analysis": self.engine.get_product_dna_analysis(),
-                "Variety Performance": self.engine.get_variety_performance(),
-                "Attribute Analysis": self.engine.get_attribute_analysis(),
-                "Price Variance Analysis": self.engine.get_price_variance_analysis(),
-                "Return Variance Explanation": self.engine.get_return_variance_explanation(),
-                "Market Benchmarking": self.engine.get_market_benchmarks(),
-                "Outlier Detection": self.engine.get_outlier_analysis(),
-                "Opportunity Finder": self.engine.get_opportunity_finder(),
-                "Profitability Drivers": self.engine.get_profitability_drivers(),
-                "Executive Scorecards": self.engine.get_executive_scorecards(),
-                "Lot Analysis": self.engine.get_profitability_by(["LOT_ID", "Region", "SETTLEMENT_STATUS", "GROWER_NAME", "COMMODITY"]),
-                "Tag Analysis": self.engine.get_tag_analysis(),  
-                "Cost Analysis": self.engine.get_cost_breakdown(active_only=True) 
-            }
-
-            for page_name, df in tables_data.items():
-                if page_name in self.tables:
-                    self.update_table(self.tables[page_name], df)
+            self.refresh_current_page_table()
 
         except Exception as e:
             QMessageBox.critical(self, "Dashboard Error", f"An error occurred while rendering tables:\n{str(e)}\n\n{traceback.format_exc()}")
@@ -3164,6 +3308,7 @@ class MainWindow(QMainWindow):
         table_widget._custom_model = model  
         proxy = QSortFilterProxyModel(table_widget)
         proxy.setSourceModel(model)
+        proxy.setSortRole(Qt.ItemDataRole.EditRole)
         table_widget._custom_proxy = proxy  
         table_widget.setModel(proxy)
 
@@ -3214,7 +3359,7 @@ class MainWindow(QMainWindow):
         if col_header == "COMMODITY":
             df_raw = self.engine.filtered_df[self.engine.filtered_df["COMMODITY"] == str(val)]
             cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN"] if c in df_raw.columns]
-            df_summary = df_raw.groupby("VARIETY", as_index=False)[cols_to_sum].sum()
+            df_summary = df_raw.groupby("VARIETY", as_index=False, observed=True)[cols_to_sum].sum()
             df_summary["Return_Per_Box"] = (df_summary["NET_RETURN"] / df_summary["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
             df_summary = df_summary.sort_values(by="Return_Per_Box", ascending=False)
             dialog = GenericAnalysisWindow(f"Commodity Analysis: {val}", df_summary, df_raw, self)
@@ -3224,7 +3369,7 @@ class MainWindow(QMainWindow):
         if col_header == "VARIETY":
             df_raw = self.engine.filtered_df[self.engine.filtered_df["VARIETY"] == str(val)]
             cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN"] if c in df_raw.columns]
-            df_summary = df_raw.groupby(["GRADE", "SIZENAME"], as_index=False)[cols_to_sum].sum()
+            df_summary = df_raw.groupby(["GRADE", "SIZENAME"], as_index=False, observed=True)[cols_to_sum].sum()
             df_summary["Return_Per_Box"] = (df_summary["NET_RETURN"] / df_summary["QTY_RECEIVED"].replace(0, np.nan)).fillna(0)
             df_summary = df_summary.sort_values(by="Return_Per_Box", ascending=False)
             dialog = GenericAnalysisWindow(f"Variety Analysis: {val}", df_summary, df_raw, self)
