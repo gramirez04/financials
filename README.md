@@ -1815,7 +1815,10 @@ class SettlementEngine:
             dynamic_cost_cols = ["TARIFF"]
         else:
             dynamic_cost_cols = []
-        cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + dynamic_cost_cols + [c for c in cost_cols_found if c != "TARIFF"] if c in self.filtered_df.columns]
+        cols_to_sum = list(dict.fromkeys(
+            c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + dynamic_cost_cols + [c for c in cost_cols_found if c != "TARIFF"]
+            if c in self.filtered_df.columns
+        ))
 
         def build_tag_analysis() -> pd.DataFrame:
             grouped = self._grouped_sum(self.filtered_df, group_cols, cols_to_sum)
@@ -3322,7 +3325,11 @@ class MainWindow(QMainWindow):
         page_name = self.page_names_by_index.get(self.stacked_widget.currentIndex() if index is None else index)
         if not page_name or page_name not in self.tables:
             return
-        self.update_table(self.tables[page_name], self.get_page_dataframe(page_name))
+        cache_key = self._page_cache_key(page_name)
+        table = self.tables[page_name]
+        if getattr(table, "_page_cache_key", None) == cache_key:
+            return
+        self.update_table(table, self.get_page_dataframe(page_name), cache_key)
 
     def _page_cache_key(self, page_name: str) -> Tuple:
         return (page_name, self.engine.view_cache_token)
@@ -3350,13 +3357,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Dashboard Error", f"An error occurred while rendering tables:\n{str(e)}\n\n{traceback.format_exc()}")
 
-    def update_table(self, table_widget: QTableView, df: pd.DataFrame):
+    def update_table(self, table_widget: QTableView, df: pd.DataFrame, cache_key: Optional[Tuple] = None):
         model = PandasModel(df, parent=table_widget)
         table_widget._custom_model = model  
         proxy = QSortFilterProxyModel(table_widget)
         proxy.setSourceModel(model)
         proxy.setSortRole(Qt.ItemDataRole.UserRole)
         table_widget._custom_proxy = proxy  
+        table_widget._page_cache_key = cache_key
         table_widget.setModel(proxy)
 
     def handle_dialog_drilldown(self, index: QModelIndex, table: QTableView, current_history: str = "Global Filter"):
