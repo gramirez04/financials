@@ -1448,7 +1448,7 @@ TEXT_COLUMNS = ["GROWER_NAME", "COMMODITY", "VARIETY", "STYLE", "SIZENAME", "COL
 INVALID_TEXT_VALUES = {"nan", "<na>", "none", "unknown", ""}
 WHOLE_NUMBER_COLUMN_TOKENS = ("QTY", "QUANTITY", "VOLUME", "UNIT", "UNITS", "COUNT", "TOTAL BOXES")
 WHOLE_NUMBER_COLUMN_NAMES = {"COUNT", "TOTAL GROWERS", "TOTAL LOTS", "TOTAL COMMODITIES", "TOTAL VARIETIES"}
-PERCENT_COLUMN_TOKENS = ("MARGIN", "%", "RET_%", "PERCENT", "PERCENTILE", "RANK", "SCORE")
+PERCENT_COLUMN_NAMES = {"GROWER RETURN %", "GROWER RET %", "COMMISSION %", "VARIANCE %", "PERCENTILE RANK", "IMPORTANCE SCORE"}
 
 def normalize_display_column_name(column_name: str) -> str:
     return str(column_name).replace("_", " ").strip().upper()
@@ -1463,7 +1463,11 @@ def is_whole_number_column(column_name: str) -> bool:
 
 def is_percent_column(column_name: str) -> bool:
     normalized = normalize_display_column_name(column_name)
-    return any(token in normalized for token in PERCENT_COLUMN_TOKENS)
+    return "%" in normalized or normalized in PERCENT_COLUMN_NAMES
+
+def is_excel_percent_column(column_name: str) -> bool:
+    normalized = normalize_display_column_name(column_name)
+    return "%" in normalized or normalized in {"PERCENTILE RANK", "IMPORTANCE SCORE"}
 
 # ==========================================
 # 2. DATA CALCULATION ENGINE
@@ -1814,12 +1818,18 @@ class SettlementEngine:
         group_cols = [c for c in ["SETTLEMENT_RUN", "LOT_ID", "GROWER_NAME", "COMMODITY", "VARIETY", "BLOCK_NAME", "PALLET_TAG_ID"] if c in self.filtered_df.columns]
         
         cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
-        dynamic_cost_cols = [c for c in ["_TARIFFS"] if c in self.filtered_df.columns]
+        dynamic_cost_cols = [c for c in ["_TARIFFS", "TARIFF"] if c in self.filtered_df.columns]
         cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + dynamic_cost_cols + [c for c in cost_cols_found if c != "TARIFF"] if c in self.filtered_df.columns]
 
         def build_tag_analysis() -> pd.DataFrame:
             grouped = self._grouped_sum(self.filtered_df, group_cols, cols_to_sum)
-            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return", "_TARIFFS": "Tariff"})
+            grouped = grouped.rename(columns={"QTY_RECEIVED": "Qty", "TOTAL_REVENUE": "Gross_Sales", "TOTAL_COSTS": "Total_Costs", "NET_RETURN": "Net_Return"})
+            if "_TARIFFS" in grouped.columns:
+                grouped["Tariff"] = grouped["_TARIFFS"]
+            elif "TARIFF" in grouped.columns:
+                grouped["Tariff"] = grouped["TARIFF"]
+            else:
+                grouped["Tariff"] = 0.0
 
             qty = grouped["Qty"] if "Qty" in grouped.columns else pd.Series(dtype=float)
             sales = grouped["Gross_Sales"] if "Gross_Sales" in grouped.columns else pd.Series(dtype=float)
@@ -2144,7 +2154,7 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
                 elif is_whole_number_column(col):
                     for cell in worksheet[letter][1:]:
                         cell.number_format = "#,##0"
-                elif is_percent_column(col):
+                elif is_excel_percent_column(col):
                     for cell in worksheet[letter][1:]:
                         if isinstance(cell.value, (int, float)):
                             cell.value = cell.value / 100
