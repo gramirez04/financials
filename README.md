@@ -1578,6 +1578,8 @@ class SettlementEngine:
 
     def _clear_analysis_cache(self) -> None:
         self.analysis_cache = {}
+
+    def _clear_page_cache(self) -> None:
         self.current_page_cache = {}
 
     @staticmethod
@@ -1605,6 +1607,10 @@ class SettlementEngine:
         )
 
     def _ensure_runtime_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        opex_cols_map = getattr(self, "opex_cols_map", {})
+        tar_cols = getattr(self, "tar_cols", [])
+        adv_cols = getattr(self, "adv_cols", [])
+        comm_cols = getattr(self, "comm_cols", [])
         if "SETTLEMENT_RUN" not in df.columns:
             df["SETTLEMENT_RUN"] = pd.NA
 
@@ -1629,13 +1635,13 @@ class SettlementEngine:
         if "TOTAL_REVENUE" not in df.columns:
             df["TOTAL_REVENUE"] = df[revenue_cols].sum(axis=1) if revenue_cols else 0.0
         if "_OPEX_BASE" not in df.columns:
-            df["_OPEX_BASE"] = df[[c for c in self.opex_cols_map.keys() if c in df.columns]].sum(axis=1) if self.opex_cols_map else 0.0
+            df["_OPEX_BASE"] = df[[c for c in opex_cols_map.keys() if c in df.columns]].sum(axis=1) if opex_cols_map else 0.0
         if "_TARIFFS_BASE" not in df.columns:
-            df["_TARIFFS_BASE"] = df[[c for c in self.tar_cols if c in df.columns]].sum(axis=1) if self.tar_cols else 0.0
+            df["_TARIFFS_BASE"] = df[[c for c in tar_cols if c in df.columns]].sum(axis=1) if tar_cols else 0.0
         if "_ADVANCES_BASE" not in df.columns:
-            df["_ADVANCES_BASE"] = df[[c for c in self.adv_cols if c in df.columns]].sum(axis=1) if self.adv_cols else 0.0
+            df["_ADVANCES_BASE"] = df[[c for c in adv_cols if c in df.columns]].sum(axis=1) if adv_cols else 0.0
         if "_COMMISSIONS_BASE" not in df.columns:
-            df["_COMMISSIONS_BASE"] = df[[c for c in self.comm_cols if c in df.columns]].sum(axis=1) if self.comm_cols else 0.0
+            df["_COMMISSIONS_BASE"] = df[[c for c in comm_cols if c in df.columns]].sum(axis=1) if comm_cols else 0.0
         if "SEARCH_STRING" not in df.columns:
             df["SEARCH_STRING"] = df[TEXT_COLUMNS].astype(str).agg(" ".join, axis=1).str.lower()
         return df
@@ -1646,6 +1652,7 @@ class SettlementEngine:
                 self.raw_df = pd.read_pickle(CACHE_FILE)
                 self.raw_df = self._ensure_runtime_columns(self.raw_df)
                 self._clear_analysis_cache()
+                self._clear_page_cache()
                 self._build_filter_cache()
                 self.apply_filters({}, "", True, True)
                 return True
@@ -1673,6 +1680,7 @@ class SettlementEngine:
             self.raw_df = df
             self.save_cache()
             self._clear_analysis_cache()
+            self._clear_page_cache()
             self._build_filter_cache()
             
             self.apply_filters({}, "", True, True) 
@@ -1708,6 +1716,7 @@ class SettlementEngine:
             self.filtered_df = pd.DataFrame()
             self.dynamic_full_df = pd.DataFrame()
             self._clear_analysis_cache()
+            self._clear_page_cache()
             return
 
         self.inc_adv = inc_adv
@@ -1730,6 +1739,7 @@ class SettlementEngine:
         self.dynamic_full_df = df_full
         self.filtered_df = df_full.loc[self._build_mask(df_full, filter_dict, search_text)].copy()
         self._clear_analysis_cache()
+        self._clear_page_cache()
 
     def get_kpis(self) -> dict:
         if self.filtered_df.empty:
