@@ -1809,7 +1809,12 @@ class SettlementEngine:
         group_cols = [c for c in ["SETTLEMENT_RUN", "LOT_ID", "GROWER_NAME", "COMMODITY", "VARIETY", "BLOCK_NAME", "PALLET_TAG_ID"] if c in self.filtered_df.columns]
         
         cost_cols_found = [c for c in list(self.opex_cols_map.keys()) + self.tar_cols + self.adv_cols + self.comm_cols if c in self.filtered_df.columns]
-        dynamic_cost_cols = [c for c in ["_TARIFFS", "TARIFF"] if c in self.filtered_df.columns]
+        if "_TARIFFS" in self.filtered_df.columns:
+            dynamic_cost_cols = ["_TARIFFS"]
+        elif "TARIFF" in self.filtered_df.columns:
+            dynamic_cost_cols = ["TARIFF"]
+        else:
+            dynamic_cost_cols = []
         cols_to_sum = [c for c in ["QTY_RECEIVED", "TOTAL_REVENUE", "TOTAL_COSTS", "NET_RETURN", "_COMMISSIONS"] + dynamic_cost_cols + [c for c in cost_cols_found if c != "TARIFF"] if c in self.filtered_df.columns]
 
         def build_tag_analysis() -> pd.DataFrame:
@@ -2137,7 +2142,9 @@ def export_df_to_excel(df: pd.DataFrame, title: str, parent_widget: QWidget):
             for idx, col in enumerate(df.columns):
                 display_series = df[col]
                 series = export_df[col]
-                max_len = max((display_series.astype(str).map(len).max(), len(str(display_series.name)))) + 2
+                content_len = display_series.astype(str).map(len).max()
+                content_len = int(content_len) if pd.notna(content_len) else 0
+                max_len = max(content_len, len(str(display_series.name))) + 2
                 
                 # Dynamic column letter conversion to bypass >26 columns bug ('[' error)
                 col_idx = idx + 1
