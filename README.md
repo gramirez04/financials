@@ -3208,6 +3208,8 @@ class MainWindow(QMainWindow):
     def on_data_loaded(self, request_id, success, msg, df, preserved_state, show_error_dialog):
         if request_id != self._active_load_id:
             return
+        should_restart_refresh = self._refresh_pending
+        self._refresh_pending = False
         self.loader_thread = None
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
@@ -3226,8 +3228,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().clearMessage()
             else:
                 self.statusBar().showMessage("Background refresh failed; continuing with cached data.", 5000)
-        if self._refresh_pending:
-            QTimer.singleShot(0, self.refresh_data_in_background)
+        if should_restart_refresh:
+            QTimer.singleShot(0, lambda: self.load_data_from_db(user_initiated=False))
 
     def reset_filters(self):
         if not self.engine.raw_df.empty: 
