@@ -2070,17 +2070,16 @@ class SettlementEngine:
 # THREADING FOR SQL LOAD (NON-BLOCKING UX)
 # ==========================================
 class DataLoaderThread(QThread):
-    finished_signal = Signal(int, bool, str, object, object, bool)
-    def __init__(self, engine, request_id: int, view_state=None, show_error_dialog=True):
+    finished_signal = Signal(int, bool, str, object, object)
+    def __init__(self, engine, request_id: int, request_context: dict):
         super().__init__()
         self.engine = engine
         self.request_id = request_id
-        self.view_state = view_state
-        self.show_error_dialog = show_error_dialog
+        self.request_context = request_context
 
     def run(self):
         success, msg, df = self.engine.fetch_data()
-        self.finished_signal.emit(self.request_id, success, msg, df, self.view_state, self.show_error_dialog)
+        self.finished_signal.emit(self.request_id, success, msg, df, self.request_context)
 
 # ==========================================
 # 3. UI COMPONENTS (POLISHED)
@@ -2618,9 +2617,9 @@ class MainWindow(QMainWindow):
         self.setup_app_ui()
         self.setCentralWidget(self.app_widget)
         self.auto_refresh_timer = QTimer(self)
+        self.auto_refresh_timer.setSingleShot(True)
         self.auto_refresh_timer.setInterval(AUTO_REFRESH_INTERVAL_MS)
         self.auto_refresh_timer.timeout.connect(self.refresh_data_in_background)
-        self.auto_refresh_timer.start()
 
         # STARTUP: Check for local cache before hitting the database
         if self.engine.load_cache():
@@ -3194,32 +3193,49 @@ class MainWindow(QMainWindow):
     def refresh_data_in_background(self):
         self.load_data_from_db(user_initiated=False)
 
-    def load_data_from_db(self, user_initiated: bool = True):
-        if self.loader_thread is not None and self.loader_thread.isRunning():
-            if user_initiated:
-                pending_request = self._pending_refresh_request or {"user_initiated": False}
-                pending_request["user_initiated"] = True
-                self._pending_refresh_request = pending_request
-                self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
-            return
+    def _schedule_next_auto_refresh(self):
+        self.auto_refresh_timer.start()
 
-        preserve_state = not self.engine.raw_df.empty
-        view_state = self._capture_view_state() if preserve_state else None
-        show_error_dialog = user_initiated or self.engine.raw_df.empty
-        self._pending_refresh_request = None
+    def _start_data_load(self, request_context: dict):
+        self.auto_refresh_timer.stop()
+        user_initiated = request_context.get("user_initiated", False)
+        show_error_dialog = request_context.get("show_error_dialog", False)
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
+        self._pending_refresh_request = None
         self._active_load_id += 1
-        self.loader_thread = DataLoaderThread(self.engine, self._active_load_id, view_state=view_state, show_error_dialog=show_error_dialog)
+        self.loader_thread = DataLoaderThread(self.engine, self._active_load_id, request_context=request_context)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
 
-    def on_data_loaded(self, request_id, success, msg, df, preserved_state, show_error_dialog):
+    def load_data_from_db(self, user_initiated: bool = True):
+        preserve_state = not self.engine.raw_df.empty
+        request_context = {
+            "user_initiated": user_initiated,
+            "show_error_dialog": user_initiated or self.engine.raw_df.empty,
+            "use_live_state": not user_initiated,
+            "view_state": self._capture_view_state() if preserve_state and user_initiated else None,
+        }
+        if self.loader_thread is not None and self.loader_thread.isRunning():
+            if user_initiated:
+                self._pending_refresh_request = request_context
+                self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
+            elif self._pending_refresh_request is None:
+                self._pending_refresh_request = request_context
+            return
+
+        self._start_data_load(request_context)
+
+    def on_data_loaded(self, request_id, success, msg, df, request_context):
         if request_id != self._active_load_id:
+            if self.loader_thread is not None and getattr(self.loader_thread, "request_id", None) == request_id:
+                self.loader_thread = None
             return
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
         self.loader_thread = None
+        preserved_state = self._capture_view_state() if request_context.get("use_live_state") and not self.engine.raw_df.empty else request_context.get("view_state")
+        show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
             if preserved_state:
@@ -3238,7 +3254,9 @@ class MainWindow(QMainWindow):
             else:
                 self.statusBar().showMessage("Background refresh failed; continuing with cached data.", 5000)
         if pending_request:
-            QTimer.singleShot(0, lambda: self.load_data_from_db(user_initiated=pending_request.get("user_initiated", False)))
+            QTimer.singleShot(0, lambda req=pending_request: self._start_data_load(req))
+        else:
+            self._schedule_next_auto_refresh()
 
     def reset_filters(self):
         if not self.engine.raw_df.empty: 
