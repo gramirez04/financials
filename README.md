@@ -1715,7 +1715,7 @@ class SettlementEngine:
 
         self.inc_adv = inc_adv
         self.inc_tar = inc_tar
-        df_full = self.raw_df
+        df_full = self.raw_df.copy()
 
         df_full["_OPEX"] = df_full["_OPEX_BASE"] if "_OPEX_BASE" in df_full.columns else 0.0
         df_full["_TARIFFS"] = df_full["_TARIFFS_BASE"] if "_TARIFFS_BASE" in df_full.columns else 0.0
