@@ -3233,8 +3233,6 @@ class MainWindow(QMainWindow):
 
     def on_data_loaded(self, request_id, success, msg, df, request_context):
         if request_id != self._active_load_id:
-            if self.loader_thread is not None and getattr(self.loader_thread, "request_id", None) == request_id:
-                self.loader_thread = None
             return
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
