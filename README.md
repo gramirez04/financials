@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QGridLayout, QScrollArea, QSizePolicy,
     QLineEdit, QCheckBox, QToolBar, QMenu
 )
-from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QThread, Signal
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QThread, Signal, QTimer
 from PySide6.QtGui import QFont, QAction, QPainter, QColor
 
 from PySide6.QtCharts import (
@@ -1377,10 +1377,6 @@ LEFT JOIN LotMetrics lm
   ON fc.lot_id = lm.lotid
 LEFT JOIN TariffRule tr
   ON fc.settlement_run = tr.garunidx
-ORDER BY
-    fc.received_date DESC,
-    fc.lot_id,
-    fc.pallet_tag_id;
 """
 
 # ==========================================
@@ -1388,6 +1384,7 @@ ORDER BY
 # ==========================================
 CONFIG_FILE = "settlement_config.json"
 CACHE_FILE = "last_run_data.pkl"
+AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000
 
 DEFAULT_CONFIG = {
     "UNIT_NAME": "Box",
@@ -1656,38 +1653,39 @@ class SettlementEngine:
                 return False
         return False
 
-    def save_cache(self):
+    def save_cache(self, df: Optional[pd.DataFrame] = None):
         try:
-            self.raw_df.to_pickle(CACHE_FILE)
+            target_df = self.raw_df if df is None else df
+            target_df.to_pickle(CACHE_FILE)
         except Exception as e:
             print(f"Failed to save cache: {e}")
 
-    def load_data(self) -> Tuple[bool, str]:
+    def _prepare_loaded_data(self) -> pd.DataFrame:
+        df = self._read_sql_fast()
+        df = self._ensure_columns(df)
+        numeric_cols = APP_CONFIG["REVENUE_COLUMNS"] + ALL_COST_COLUMNS + APP_CONFIG["ADVANCE_COLUMNS"] + ["QTY_RECEIVED", "TARIFF"]
+        self._coerce_numeric(df, numeric_cols)
+        self._normalize_text(df, TEXT_COLUMNS)
+        return self._ensure_runtime_columns(df)
+
+    def apply_loaded_data(self, df: pd.DataFrame) -> None:
+        self.raw_df = df
+        self._clear_analysis_cache()
+        self._clear_page_cache()
+        self._build_filter_cache()
+        self.last_error = ""
+
+    def load_data(self) -> Tuple[bool, str, Optional[pd.DataFrame]]:
         try:
-            df = self._read_sql_fast()
-            df = self._ensure_columns(df)
-
-            numeric_cols = APP_CONFIG["REVENUE_COLUMNS"] + ALL_COST_COLUMNS + APP_CONFIG["ADVANCE_COLUMNS"] + ["QTY_RECEIVED", "TARIFF"]
-            self._coerce_numeric(df, numeric_cols)
-            self._normalize_text(df, TEXT_COLUMNS)
-            df = self._ensure_runtime_columns(df)
-
-            self.raw_df = df
-            self.save_cache()
-            self._clear_analysis_cache()
-            self._clear_page_cache()
-            self._build_filter_cache()
-            
-            self.apply_filters({}, "", True, True) 
-            self.last_error = ""
-            return True, "Data loaded successfully."
-            
+            df = self._prepare_loaded_data()
+            self.save_cache(df)
+            return True, "Data loaded successfully.", df
         except ValueError as ve:
             self.last_error = str(ve)
-            return False, self.last_error
+            return False, self.last_error, None
         except Exception:
             self.last_error = traceback.format_exc()
-            return False, f"Unexpected error:\n{self.last_error}"
+            return False, f"Unexpected error:\n{self.last_error}", None
 
     def _build_filter_cache(self) -> None:
         if self.raw_df.empty:
@@ -2054,14 +2052,14 @@ class SettlementEngine:
 # THREADING FOR SQL LOAD (NON-BLOCKING UX)
 # ==========================================
 class DataLoaderThread(QThread):
-    finished_signal = Signal(bool, str)
+    finished_signal = Signal(bool, str, object)
     def __init__(self, engine):
         super().__init__()
         self.engine = engine
 
     def run(self):
-        success, msg = self.engine.load_data()
-        self.finished_signal.emit(success, msg)
+        success, msg, df = self.engine.load_data()
+        self.finished_signal.emit(success, msg, df)
 
 # ==========================================
 # 3. UI COMPONENTS (POLISHED)
@@ -2588,6 +2586,9 @@ class MainWindow(QMainWindow):
 
         self.engine = SettlementEngine()
         self.updating_filters = False
+        self.loader_thread: Optional[DataLoaderThread] = None
+        self._load_preserve_state = False
+        self._load_show_error_dialog = True
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -2595,6 +2596,10 @@ class MainWindow(QMainWindow):
         self.setup_menu()
         self.setup_app_ui()
         self.setCentralWidget(self.app_widget)
+        self.auto_refresh_timer = QTimer(self)
+        self.auto_refresh_timer.setInterval(AUTO_REFRESH_INTERVAL_MS)
+        self.auto_refresh_timer.timeout.connect(self.refresh_data_in_background)
+        self.auto_refresh_timer.start()
 
         # STARTUP: Check for local cache before hitting the database
         if self.engine.load_cache():
@@ -2602,9 +2607,10 @@ class MainWindow(QMainWindow):
             try:
                 mod_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE)).strftime("%Y-%m-%d %I:%M:%S %p")
                 self.lbl_timestamp.setText(f"Last Update (Local Cache): {mod_time}")
-                self.statusBar().showMessage(f"Loaded local cache from {mod_time}.", 5000)
+                self.statusBar().showMessage(f"Loaded local cache from {mod_time}. Refreshing in background...", 5000)
             except Exception:
                 pass
+            self.refresh_data_in_background()
         else:
             self.load_data_from_db()
 
@@ -3104,26 +3110,103 @@ class MainWindow(QMainWindow):
 
         dialog.exec()
 
-    def load_data_from_db(self):
-        self.statusBar().showMessage("Connecting to FAMOUSODBC and pulling data...")
-        self.btn_reset_filters.setEnabled(False)
-        
+    def _capture_view_state(self) -> dict:
+        return {
+            "filters": {col: cb.currentText() for col, cb in self.combos.items()},
+            "search_text": self.search_box.text(),
+            "inc_adv": self.cb_inc_advances.isChecked(),
+            "inc_tar": self.cb_inc_tariffs.isChecked(),
+            "page_index": self.stacked_widget.currentIndex(),
+            "top_n": self.cb_top_n.currentText(),
+        }
+
+    def _restore_view_state(self, state: Optional[dict] = None, default_to_settled: bool = False):
+        self.updating_filters = True
+        selected_filters = state.get("filters", {}) if state else {}
+        try:
+            for cb in self.combos.values():
+                cb.blockSignals(True)
+            self.search_box.blockSignals(True)
+            self.cb_inc_advances.blockSignals(True)
+            self.cb_inc_tariffs.blockSignals(True)
+            self.cb_top_n.blockSignals(True)
+
+            for col, cb in self.combos.items():
+                cb.clear()
+                vals = ["All"] + self.engine.filter_cache.get(col, [])
+                cb.addItems(vals)
+                target = selected_filters.get(col, "All")
+                if target in vals:
+                    cb.setCurrentText(target)
+                elif col == "SETTLEMENT_STATUS" and default_to_settled:
+                    idx = cb.findText("Settled")
+                    cb.setCurrentIndex(idx if idx >= 0 else 0)
+                else:
+                    cb.setCurrentText("All")
+
+            self.search_box.setText(state.get("search_text", "") if state else "")
+            self.cb_inc_advances.setChecked(state.get("inc_adv", True) if state else True)
+            self.cb_inc_tariffs.setChecked(state.get("inc_tar", True) if state else True)
+
+            top_n_value = state.get("top_n") if state else None
+            if top_n_value and self.cb_top_n.findText(top_n_value) >= 0:
+                self.cb_top_n.setCurrentText(top_n_value)
+        finally:
+            for cb in self.combos.values():
+                cb.blockSignals(False)
+            self.search_box.blockSignals(False)
+            self.cb_inc_advances.blockSignals(False)
+            self.cb_inc_tariffs.blockSignals(False)
+            self.cb_top_n.blockSignals(False)
+            self.updating_filters = False
+
+        active_filters = {col: cb.currentText() for col, cb in self.combos.items()}
+        self.engine.apply_filters(
+            active_filters,
+            self.search_box.text().strip(),
+            self.cb_inc_advances.isChecked(),
+            self.cb_inc_tariffs.isChecked(),
+        )
+        self.navigate_to_page(state.get("page_index", 0) if state else 0)
+        self.update_dashboard()
+
+    def refresh_data_in_background(self):
+        self.load_data_from_db(user_initiated=False)
+
+    def load_data_from_db(self, user_initiated: bool = True):
+        if self.loader_thread is not None and self.loader_thread.isRunning():
+            if user_initiated:
+                self.statusBar().showMessage("A data refresh is already running in the background.", 5000)
+            return
+
+        self._load_preserve_state = not self.engine.raw_df.empty
+        self._load_show_error_dialog = user_initiated or self.engine.raw_df.empty
+        status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
+        self.statusBar().showMessage(status_message)
         self.loader_thread = DataLoaderThread(self.engine)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
 
-    def on_data_loaded(self, success, msg):
-        self.btn_reset_filters.setEnabled(True)
-        if success:
-            self.initialize_filters()
-            
+    def on_data_loaded(self, success, msg, df):
+        preserved_state = self._capture_view_state() if self._load_preserve_state else None
+        self.loader_thread = None
+        if success and isinstance(df, pd.DataFrame):
+            self.engine.apply_loaded_data(df)
+            if preserved_state:
+                self._restore_view_state(preserved_state)
+            else:
+                self._restore_view_state(default_to_settled=True)
+
             current_time = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
             self.lbl_timestamp.setText(f"Last Update: {current_time}")
             
             self.statusBar().showMessage(f"Engine Loaded & Calibrated successfully at {current_time}.", 5000)
         else:
-            QMessageBox.critical(self, "Database Error", f"Failed to load data from database:\n\n{msg}")
-            self.statusBar().clearMessage()
+            if self._load_show_error_dialog:
+                QMessageBox.critical(self, "Database Error", f"Failed to load data from database:\n\n{msg}")
+                self.statusBar().clearMessage()
+            else:
+                self.statusBar().showMessage("Background refresh failed; continuing with cached data.", 5000)
 
     def reset_filters(self):
         if not self.engine.raw_df.empty: 
