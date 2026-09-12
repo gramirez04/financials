@@ -3198,8 +3198,11 @@ class MainWindow(QMainWindow):
 
     def _start_data_load(self, request_context: dict):
         self.auto_refresh_timer.stop()
+        request_context = dict(request_context)
         user_initiated = request_context.get("user_initiated", False)
         show_error_dialog = request_context.get("show_error_dialog", False)
+        if user_initiated and request_context.get("view_state") is None and not self.engine.raw_df.empty:
+            request_context["view_state"] = self._capture_view_state()
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
         self._pending_refresh_request = None
@@ -3218,6 +3221,7 @@ class MainWindow(QMainWindow):
         }
         if self.loader_thread is not None and self.loader_thread.isRunning():
             if user_initiated:
+                request_context["view_state"] = None
                 self._pending_refresh_request = request_context
                 self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
             elif self._pending_refresh_request is None:
