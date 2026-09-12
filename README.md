@@ -1394,6 +1394,10 @@ def get_sql_read_chunk_size() -> int:
 
 SQL_READ_CHUNK_SIZE = get_sql_read_chunk_size()
 
+def fetch_settlement_dataframe() -> Tuple[bool, str, Optional[pd.DataFrame]]:
+    engine = SettlementEngine()
+    return engine.fetch_data()
+
 DEFAULT_CONFIG = {
     "UNIT_NAME": "Box",
     "REVENUE_COLUMNS": ["GROSS_SALES_AMOUNT"],
@@ -2078,7 +2082,7 @@ class DataLoaderThread(QThread):
         self.request_context = request_context
 
     def run(self):
-        success, msg, df = SettlementEngine().fetch_data()
+        success, msg, df = fetch_settlement_dataframe()
         self.finished_signal.emit(self.request_id, success, msg, df, self.request_context)
 
 # ==========================================
@@ -2606,7 +2610,6 @@ class MainWindow(QMainWindow):
 
         self.engine = SettlementEngine()
         self.updating_filters = False
-        self.loader_thread: Optional[DataLoaderThread] = None
         self.loader_threads: Dict[int, DataLoaderThread] = {}
         self._active_load_id = 0
         self._pending_refresh_request: Optional[dict] = None
@@ -3208,11 +3211,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message)
         self._pending_refresh_request = None
         self._active_load_id += 1
-        self.loader_thread = DataLoaderThread(self._active_load_id, request_context=request_context)
-        self.loader_threads[self._active_load_id] = self.loader_thread
-        self.loader_thread.finished.connect(self.loader_thread.deleteLater)
-        self.loader_thread.finished_signal.connect(self.on_data_loaded)
-        self.loader_thread.start()
+        loader_thread = DataLoaderThread(self._active_load_id, request_context=request_context)
+        self.loader_threads[self._active_load_id] = loader_thread
+        loader_thread.finished.connect(loader_thread.deleteLater)
+        loader_thread.finished_signal.connect(self.on_data_loaded)
+        loader_thread.start()
 
     def load_data_from_db(self, user_initiated: bool = True):
         preserve_state = not self.engine.raw_df.empty
@@ -3222,7 +3225,8 @@ class MainWindow(QMainWindow):
             "use_live_state": not user_initiated,
             "view_state": self._capture_view_state() if preserve_state and user_initiated else None,
         }
-        if self.loader_thread is not None and self.loader_thread.isRunning():
+        active_thread = self.loader_threads.get(self._active_load_id)
+        if active_thread is not None and active_thread.isRunning():
             if user_initiated:
                 request_context["view_state"] = None
                 self._pending_refresh_request = request_context
@@ -3234,12 +3238,11 @@ class MainWindow(QMainWindow):
         self._start_data_load(request_context)
 
     def on_data_loaded(self, request_id, success, msg, df, request_context):
-        finished_thread = self.loader_threads.pop(request_id, None)
+        self.loader_threads.pop(request_id, None)
         if request_id != self._active_load_id:
             return
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
-        self.loader_thread = None
         preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
         show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
