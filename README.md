@@ -1502,7 +1502,7 @@ class SettlementEngine:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", UserWarning)
                     
-                    chunks = pd.read_sql(SQL_QUERY, conn, chunksize=15000)
+                    chunks = pd.read_sql(SQL_QUERY, conn, chunksize=100000)
                     processed_chunks = []
                     
                     for chunk in chunks:
@@ -1512,12 +1512,13 @@ class SettlementEngine:
                         if keep: 
                             chunk = chunk[keep]
                         
-                        for col in TEXT_COLUMNS:
-                            if col in chunk.columns:
-                                chunk[col] = chunk[col].astype('category')
-                                
-                        for col in chunk.select_dtypes(include=['float64']).columns:
-                            chunk[col] = chunk[col].astype('float32')
+                        text_cols = [col for col in TEXT_COLUMNS if col in chunk.columns]
+                        if text_cols:
+                            chunk[text_cols] = chunk[text_cols].astype('category')
+
+                        float_cols = chunk.select_dtypes(include=['float64']).columns.tolist()
+                        if float_cols:
+                            chunk[float_cols] = chunk[float_cols].astype('float32')
                             
                         processed_chunks.append(chunk)
 
@@ -1714,7 +1715,7 @@ class SettlementEngine:
 
         self.inc_adv = inc_adv
         self.inc_tar = inc_tar
-        df_full = self.raw_df.copy()
+        df_full = self.raw_df
 
         df_full["_OPEX"] = df_full["_OPEX_BASE"] if "_OPEX_BASE" in df_full.columns else 0.0
         df_full["_TARIFFS"] = df_full["_TARIFFS_BASE"] if "_TARIFFS_BASE" in df_full.columns else 0.0
@@ -1727,7 +1728,9 @@ class SettlementEngine:
         df_full["TOTAL_COSTS"] = df_full["_OPEX"] + df_full["_COMMISSIONS"] + live_tariffs + live_advances
         df_full["NET_RETURN"] = df_full["TOTAL_REVENUE"] - df_full["TOTAL_COSTS"]
         
-        df_full["RETURN_PER_BOX"] = (df_full["NET_RETURN"] / df_full["QTY_RECEIVED"].replace(0, np.nan)).fillna(0.0)
+        qty = df_full["QTY_RECEIVED"].to_numpy(dtype=float, copy=False)
+        net_return = df_full["NET_RETURN"].to_numpy(dtype=float, copy=False)
+        df_full["RETURN_PER_BOX"] = np.divide(net_return, qty, out=np.zeros_like(qty, dtype=float), where=qty != 0)
 
         self.dynamic_full_df = df_full
         self.filtered_df = df_full.loc[self._build_mask(df_full, filter_dict, search_text)].copy()
@@ -2589,6 +2592,7 @@ class MainWindow(QMainWindow):
         self.loader_thread: Optional[DataLoaderThread] = None
         self._load_preserve_state = False
         self._load_show_error_dialog = True
+        self._pending_view_state: Optional[dict] = None
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -3181,6 +3185,7 @@ class MainWindow(QMainWindow):
 
         self._load_preserve_state = not self.engine.raw_df.empty
         self._load_show_error_dialog = user_initiated or self.engine.raw_df.empty
+        self._pending_view_state = self._capture_view_state() if self._load_preserve_state else None
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
         self.loader_thread = DataLoaderThread(self.engine)
@@ -3188,7 +3193,8 @@ class MainWindow(QMainWindow):
         self.loader_thread.start()
 
     def on_data_loaded(self, success, msg, df):
-        preserved_state = self._capture_view_state() if self._load_preserve_state else None
+        preserved_state = self._pending_view_state
+        self._pending_view_state = None
         self.loader_thread = None
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
