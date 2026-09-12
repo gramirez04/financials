@@ -1385,7 +1385,14 @@ LEFT JOIN TariffRule tr
 CONFIG_FILE = "settlement_config.json"
 CACHE_FILE = "last_run_data.pkl"
 AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000
-SQL_READ_CHUNK_SIZE = max(15000, int(os.getenv("SQL_READ_CHUNK_SIZE", "15000")))
+def get_sql_read_chunk_size() -> int:
+    try:
+        value = int(os.getenv("SQL_READ_CHUNK_SIZE", "15000"))
+        return value if value > 0 else 15000
+    except (TypeError, ValueError):
+        return 15000
+
+SQL_READ_CHUNK_SIZE = get_sql_read_chunk_size()
 
 DEFAULT_CONFIG = {
     "UNIT_NAME": "Box",
@@ -2602,7 +2609,7 @@ class MainWindow(QMainWindow):
         self.updating_filters = False
         self.loader_thread: Optional[DataLoaderThread] = None
         self._active_load_id = 0
-        self._refresh_pending = False
+        self._pending_refresh_request: Optional[dict] = None
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -3189,7 +3196,9 @@ class MainWindow(QMainWindow):
 
     def load_data_from_db(self, user_initiated: bool = True):
         if self.loader_thread is not None and self.loader_thread.isRunning():
-            self._refresh_pending = True
+            pending_request = self._pending_refresh_request or {"user_initiated": False}
+            pending_request["user_initiated"] = pending_request["user_initiated"] or user_initiated
+            self._pending_refresh_request = pending_request
             if user_initiated:
                 self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
             return
@@ -3197,7 +3206,7 @@ class MainWindow(QMainWindow):
         preserve_state = not self.engine.raw_df.empty
         view_state = self._capture_view_state() if preserve_state else None
         show_error_dialog = user_initiated or self.engine.raw_df.empty
-        self._refresh_pending = False
+        self._pending_refresh_request = None
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
         self._active_load_id += 1
@@ -3208,8 +3217,8 @@ class MainWindow(QMainWindow):
     def on_data_loaded(self, request_id, success, msg, df, preserved_state, show_error_dialog):
         if request_id != self._active_load_id:
             return
-        should_restart_refresh = self._refresh_pending
-        self._refresh_pending = False
+        pending_request = self._pending_refresh_request
+        self._pending_refresh_request = None
         self.loader_thread = None
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
@@ -3228,8 +3237,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().clearMessage()
             else:
                 self.statusBar().showMessage("Background refresh failed; continuing with cached data.", 5000)
-        if should_restart_refresh:
-            QTimer.singleShot(0, lambda: self.load_data_from_db(user_initiated=False))
+        if pending_request:
+            QTimer.singleShot(0, lambda: self.load_data_from_db(user_initiated=pending_request.get("user_initiated", False)))
 
     def reset_filters(self):
         if not self.engine.raw_df.empty: 
