@@ -1385,6 +1385,7 @@ LEFT JOIN TariffRule tr
 CONFIG_FILE = "settlement_config.json"
 CACHE_FILE = "last_run_data.pkl"
 AUTO_REFRESH_INTERVAL_MS = 15 * 60 * 1000
+SQL_READ_CHUNK_SIZE = max(15000, int(os.getenv("SQL_READ_CHUNK_SIZE", "15000")))
 
 DEFAULT_CONFIG = {
     "UNIT_NAME": "Box",
@@ -1502,7 +1503,7 @@ class SettlementEngine:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", UserWarning)
                     
-                    chunks = pd.read_sql(SQL_QUERY, conn, chunksize=100000)
+                    chunks = pd.read_sql(SQL_QUERY, conn, chunksize=SQL_READ_CHUNK_SIZE)
                     processed_chunks = []
                     
                     for chunk in chunks:
@@ -2601,6 +2602,7 @@ class MainWindow(QMainWindow):
         self.updating_filters = False
         self.loader_thread: Optional[DataLoaderThread] = None
         self._active_load_id = 0
+        self._refresh_pending = False
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -3187,13 +3189,15 @@ class MainWindow(QMainWindow):
 
     def load_data_from_db(self, user_initiated: bool = True):
         if self.loader_thread is not None and self.loader_thread.isRunning():
+            self._refresh_pending = True
             if user_initiated:
-                self.statusBar().showMessage("A data refresh is already running in the background.", 5000)
+                self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
             return
 
         preserve_state = not self.engine.raw_df.empty
         view_state = self._capture_view_state() if preserve_state else None
         show_error_dialog = user_initiated or self.engine.raw_df.empty
+        self._refresh_pending = False
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
         self._active_load_id += 1
@@ -3222,6 +3226,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().clearMessage()
             else:
                 self.statusBar().showMessage("Background refresh failed; continuing with cached data.", 5000)
+        if self._refresh_pending:
+            QTimer.singleShot(0, self.refresh_data_in_background)
 
     def reset_filters(self):
         if not self.engine.raw_df.empty: 
