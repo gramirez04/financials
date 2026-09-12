@@ -2071,14 +2071,13 @@ class SettlementEngine:
 # ==========================================
 class DataLoaderThread(QThread):
     finished_signal = Signal(int, bool, str, object, object)
-    def __init__(self, engine, request_id: int, request_context: dict):
+    def __init__(self, request_id: int, request_context: dict):
         super().__init__()
-        self.engine = engine
         self.request_id = request_id
         self.request_context = request_context
 
     def run(self):
-        success, msg, df = self.engine.fetch_data()
+        success, msg, df = SettlementEngine().fetch_data()
         self.finished_signal.emit(self.request_id, success, msg, df, self.request_context)
 
 # ==========================================
@@ -3207,7 +3206,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status_message)
         self._pending_refresh_request = None
         self._active_load_id += 1
-        self.loader_thread = DataLoaderThread(self.engine, self._active_load_id, request_context=request_context)
+        self.loader_thread = DataLoaderThread(self._active_load_id, request_context=request_context)
         self.loader_thread.finished.connect(self.loader_thread.deleteLater)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
@@ -3237,10 +3236,10 @@ class MainWindow(QMainWindow):
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
         self.loader_thread = None
+        preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
         show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
-            preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
             if preserved_state:
                 self._restore_view_state(preserved_state)
             else:
