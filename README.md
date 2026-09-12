@@ -2607,6 +2607,7 @@ class MainWindow(QMainWindow):
         self.engine = SettlementEngine()
         self.updating_filters = False
         self.loader_thread: Optional[DataLoaderThread] = None
+        self.loader_threads: Dict[int, DataLoaderThread] = {}
         self._active_load_id = 0
         self._pending_refresh_request: Optional[dict] = None
         
@@ -3208,6 +3209,7 @@ class MainWindow(QMainWindow):
         self._pending_refresh_request = None
         self._active_load_id += 1
         self.loader_thread = DataLoaderThread(self._active_load_id, request_context=request_context)
+        self.loader_threads[self._active_load_id] = self.loader_thread
         self.loader_thread.finished.connect(self.loader_thread.deleteLater)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
@@ -3232,13 +3234,12 @@ class MainWindow(QMainWindow):
         self._start_data_load(request_context)
 
     def on_data_loaded(self, request_id, success, msg, df, request_context):
-        emitting_thread = self.sender()
+        finished_thread = self.loader_threads.pop(request_id, None)
         if request_id != self._active_load_id:
             return
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
-        if emitting_thread is self.loader_thread:
-            self.loader_thread = None
+        self.loader_thread = None
         preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
         show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
