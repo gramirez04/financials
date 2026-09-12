@@ -3208,6 +3208,7 @@ class MainWindow(QMainWindow):
         self._pending_refresh_request = None
         self._active_load_id += 1
         self.loader_thread = DataLoaderThread(self.engine, self._active_load_id, request_context=request_context)
+        self.loader_thread.finished.connect(self.loader_thread.deleteLater)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
 
@@ -3238,10 +3239,10 @@ class MainWindow(QMainWindow):
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
         self.loader_thread = None
-        preserved_state = self._capture_view_state() if request_context.get("use_live_state") and not self.engine.raw_df.empty else request_context.get("view_state")
         show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
+            preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
             if preserved_state:
                 self._restore_view_state(preserved_state)
             else:
