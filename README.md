@@ -1679,6 +1679,7 @@ class SettlementEngine:
 
     def apply_loaded_data(self, df: pd.DataFrame) -> None:
         self.raw_df = df
+        self.save_cache(df)
         self._clear_analysis_cache()
         self._clear_page_cache()
         self._build_filter_cache()
@@ -2626,7 +2627,7 @@ class MainWindow(QMainWindow):
             try:
                 mod_time = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE)).strftime("%Y-%m-%d %I:%M:%S %p")
                 self.lbl_timestamp.setText(f"Last Update (Local Cache): {mod_time}")
-                self.statusBar().showMessage(f"Loaded local cache from {mod_time}. Refreshing in background...", 5000)
+                self.statusBar().showMessage(f"Loaded local cache from {mod_time}. Refreshing in background...")
             except Exception:
                 pass
             self.refresh_data_in_background()
@@ -3231,11 +3232,13 @@ class MainWindow(QMainWindow):
         self._start_data_load(request_context)
 
     def on_data_loaded(self, request_id, success, msg, df, request_context):
+        emitting_thread = self.sender()
         if request_id != self._active_load_id:
             return
         pending_request = self._pending_refresh_request
         self._pending_refresh_request = None
-        self.loader_thread = None
+        if emitting_thread is self.loader_thread:
+            self.loader_thread = None
         preserved_state = self._capture_view_state() if request_context.get("use_live_state") else request_context.get("view_state")
         show_error_dialog = request_context.get("show_error_dialog", False)
         if success and isinstance(df, pd.DataFrame):
