@@ -1676,7 +1676,7 @@ class SettlementEngine:
         self._build_filter_cache()
         self.last_error = ""
 
-    def load_data(self) -> Tuple[bool, str, Optional[pd.DataFrame]]:
+    def fetch_data(self) -> Tuple[bool, str, Optional[pd.DataFrame]]:
         try:
             df = self._prepare_loaded_data()
             self.save_cache(df)
@@ -1687,6 +1687,13 @@ class SettlementEngine:
         except Exception:
             self.last_error = traceback.format_exc()
             return False, f"Unexpected error:\n{self.last_error}", None
+
+    def load_data(self) -> Tuple[bool, str]:
+        success, msg, df = self.fetch_data()
+        if success and isinstance(df, pd.DataFrame):
+            self.apply_loaded_data(df)
+            self.apply_filters({}, "", True, True)
+        return success, msg
 
     def _build_filter_cache(self) -> None:
         if self.raw_df.empty:
@@ -2055,14 +2062,16 @@ class SettlementEngine:
 # THREADING FOR SQL LOAD (NON-BLOCKING UX)
 # ==========================================
 class DataLoaderThread(QThread):
-    finished_signal = Signal(bool, str, object)
-    def __init__(self, engine):
+    finished_signal = Signal(bool, str, object, object, bool)
+    def __init__(self, engine, view_state=None, show_error_dialog=True):
         super().__init__()
         self.engine = engine
+        self.view_state = view_state
+        self.show_error_dialog = show_error_dialog
 
     def run(self):
-        success, msg, df = self.engine.load_data()
-        self.finished_signal.emit(success, msg, df)
+        success, msg, df = self.engine.fetch_data()
+        self.finished_signal.emit(success, msg, df, self.view_state, self.show_error_dialog)
 
 # ==========================================
 # 3. UI COMPONENTS (POLISHED)
@@ -2590,9 +2599,6 @@ class MainWindow(QMainWindow):
         self.engine = SettlementEngine()
         self.updating_filters = False
         self.loader_thread: Optional[DataLoaderThread] = None
-        self._load_preserve_state = False
-        self._load_show_error_dialog = True
-        self._pending_view_state: Optional[dict] = None
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -3183,18 +3189,16 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("A data refresh is already running in the background.", 5000)
             return
 
-        self._load_preserve_state = not self.engine.raw_df.empty
-        self._load_show_error_dialog = user_initiated or self.engine.raw_df.empty
-        self._pending_view_state = self._capture_view_state() if self._load_preserve_state else None
+        preserve_state = not self.engine.raw_df.empty
+        view_state = self._capture_view_state() if preserve_state else None
+        show_error_dialog = user_initiated or self.engine.raw_df.empty
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
-        self.loader_thread = DataLoaderThread(self.engine)
+        self.loader_thread = DataLoaderThread(self.engine, view_state=view_state, show_error_dialog=show_error_dialog)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
 
-    def on_data_loaded(self, success, msg, df):
-        preserved_state = self._pending_view_state
-        self._pending_view_state = None
+    def on_data_loaded(self, success, msg, df, preserved_state, show_error_dialog):
         self.loader_thread = None
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
@@ -3208,7 +3212,7 @@ class MainWindow(QMainWindow):
             
             self.statusBar().showMessage(f"Engine Loaded & Calibrated successfully at {current_time}.", 5000)
         else:
-            if self._load_show_error_dialog:
+            if show_error_dialog:
                 QMessageBox.critical(self, "Database Error", f"Failed to load data from database:\n\n{msg}")
                 self.statusBar().clearMessage()
             else:
