@@ -3196,10 +3196,10 @@ class MainWindow(QMainWindow):
 
     def load_data_from_db(self, user_initiated: bool = True):
         if self.loader_thread is not None and self.loader_thread.isRunning():
-            pending_request = self._pending_refresh_request or {"user_initiated": False}
-            pending_request["user_initiated"] = pending_request["user_initiated"] or user_initiated
-            self._pending_refresh_request = pending_request
             if user_initiated:
+                pending_request = self._pending_refresh_request or {"user_initiated": False}
+                pending_request["user_initiated"] = True
+                self._pending_refresh_request = pending_request
                 self.statusBar().showMessage("A data refresh is already running; another refresh will start when it finishes.", 5000)
             return
 
