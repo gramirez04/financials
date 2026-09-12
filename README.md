@@ -2062,16 +2062,17 @@ class SettlementEngine:
 # THREADING FOR SQL LOAD (NON-BLOCKING UX)
 # ==========================================
 class DataLoaderThread(QThread):
-    finished_signal = Signal(bool, str, object, object, bool)
-    def __init__(self, engine, view_state=None, show_error_dialog=True):
+    finished_signal = Signal(int, bool, str, object, object, bool)
+    def __init__(self, engine, request_id: int, view_state=None, show_error_dialog=True):
         super().__init__()
         self.engine = engine
+        self.request_id = request_id
         self.view_state = view_state
         self.show_error_dialog = show_error_dialog
 
     def run(self):
         success, msg, df = self.engine.fetch_data()
-        self.finished_signal.emit(success, msg, df, self.view_state, self.show_error_dialog)
+        self.finished_signal.emit(self.request_id, success, msg, df, self.view_state, self.show_error_dialog)
 
 # ==========================================
 # 3. UI COMPONENTS (POLISHED)
@@ -2599,6 +2600,7 @@ class MainWindow(QMainWindow):
         self.engine = SettlementEngine()
         self.updating_filters = False
         self.loader_thread: Optional[DataLoaderThread] = None
+        self._active_load_id = 0
         
         self.root_stack = QStackedWidget()
         self.setCentralWidget(self.root_stack)
@@ -3194,11 +3196,14 @@ class MainWindow(QMainWindow):
         show_error_dialog = user_initiated or self.engine.raw_df.empty
         status_message = "Connecting to FAMOUSODBC and pulling data..." if user_initiated else "Refreshing data from database in the background..."
         self.statusBar().showMessage(status_message)
-        self.loader_thread = DataLoaderThread(self.engine, view_state=view_state, show_error_dialog=show_error_dialog)
+        self._active_load_id += 1
+        self.loader_thread = DataLoaderThread(self.engine, self._active_load_id, view_state=view_state, show_error_dialog=show_error_dialog)
         self.loader_thread.finished_signal.connect(self.on_data_loaded)
         self.loader_thread.start()
 
-    def on_data_loaded(self, success, msg, df, preserved_state, show_error_dialog):
+    def on_data_loaded(self, request_id, success, msg, df, preserved_state, show_error_dialog):
+        if request_id != self._active_load_id:
+            return
         self.loader_thread = None
         if success and isinstance(df, pd.DataFrame):
             self.engine.apply_loaded_data(df)
